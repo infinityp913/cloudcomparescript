@@ -6,12 +6,12 @@ import requests
 import matplotlib
 import os
 
-json_filepath = "example.json"
+json_filepath = "example-17000.json"
 
 with open(json_filepath, "r") as f:
     job_data = json.load(f)
 
-INPUT_MESH_PATH = os.path.expanduser("~/TARP/")
+INPUT_MESH_PATH = os.path.expanduser("~/Documents/TARP/ply/")
 DATA_DIR = os.path.expanduser("./Data")
 
 os.makedirs(DATA_DIR, exist_ok=True)

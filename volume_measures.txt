@@ -84,3 +84,5 @@ SU18045	58250.26	-0.420886490093465	There might be a hole in the mesh.
 SU17013	11132.36	-0.41034509332623714	No issues detected.
 SU17007	30539.51	-0.2693824499605531	No issues detected.
 SU17012	34036.29	-0.2658759661089134	No issues detected.
+SU17015	518603.28	0.2630947133722144	There might be a hole in the mesh.
+SU17015	126514.79	0.11860840253448117	There might be a hole in the mesh.

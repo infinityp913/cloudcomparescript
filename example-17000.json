@@ -1,6 +1,7 @@
 [
   {
     "top": "710",
-    "bottom": "720"
+    "bottom": "720",
+    "annotations": ["SU_17015_annotation.png"]
   }
 ]
