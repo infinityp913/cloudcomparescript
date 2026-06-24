@@ -487,13 +487,22 @@ def _compute_lidar_dem_wall_pts(
     c1 = W - c0
     center_mask[r0:r1, c0:c1] = True
 
-    dmin, dmax = float(np.nanmin(dem)), float(np.nanmax(dem))
-    dem_norm = (dem - dmin) / max(dmax - dmin, 1e-6)
+    # Normalise elevation relative to the center region only, so pct selects
+    # the bottom fraction of whatever elevation range exists in the center
+    # (not the global range, which may be dominated by cells outside the center).
+    center_valid = valid & center_mask
+    if center_valid.any():
+        dmin = float(np.nanmin(dem[center_valid]))
+        dmax = float(np.nanmax(dem[center_valid]))
+    else:
+        dmin, dmax = float(np.nanmin(dem)), float(np.nanmax(dem))
+    dem_norm = np.full_like(dem, np.nan)
+    dem_norm[center_valid] = (dem[center_valid] - dmin) / max(dmax - dmin, 1e-6)
     thresh_norm = pct / 100.0
     if use_floor:
-        wr, wc = np.where(valid & center_mask & (dem_norm <= thresh_norm))
+        wr, wc = np.where(center_valid & (dem_norm <= thresh_norm))
     else:
-        wr, wc = np.where(valid & center_mask & (dem_norm >= thresh_norm))
+        wr, wc = np.where(center_valid & (dem_norm >= thresh_norm))
     wall_pts = np.stack([x0 + wc * cell_size, z0 + wr * cell_size], axis=1)
     return wall_pts, dem, (x0, z0)
 
@@ -571,17 +580,23 @@ def _load_geotiff_dem_wall_pts(
     c1 = W_d - c0
     center_mask[r0:r1, c0:c1] = True
 
-    # Normalize to [0,1] and apply fixed fraction threshold so this DEM and
-    # the LiDAR DEM both select the same RELATIVE elevation band.
+    # Normalise elevation relative to the center region only, so pct selects
+    # the bottom fraction of whatever elevation range exists in the center
+    # (not the global range, which is dominated by surrounding terrain).
     valid  = ~np.isnan(dem)
-    dmin, dmax = float(np.nanmin(dem)), float(np.nanmax(dem))
-    dem_norm = np.zeros_like(dem)
-    dem_norm[valid] = (dem[valid] - dmin) / max(dmax - dmin, 1e-6)
+    center_valid = valid & center_mask
+    if center_valid.any():
+        dmin = float(np.nanmin(dem[center_valid]))
+        dmax = float(np.nanmax(dem[center_valid]))
+    else:
+        dmin, dmax = float(np.nanmin(dem)), float(np.nanmax(dem))
+    dem_norm = np.full_like(dem, np.nan)
+    dem_norm[center_valid] = (dem[center_valid] - dmin) / max(dmax - dmin, 1e-6)
     thresh_norm = wall_pct / 100.0
     if use_floor:
-        wr, wc = np.where(valid & center_mask & (dem_norm <= thresh_norm))
+        wr, wc = np.where(center_valid & (dem_norm <= thresh_norm))
     else:
-        wr, wc = np.where(valid & center_mask & (dem_norm >= thresh_norm))
+        wr, wc = np.where(center_valid & (dem_norm >= thresh_norm))
 
     # Pixel (row, col) → UTM → PLY local
     utm_x   = dem_utm_x0   + wc * gt[1]   # left edge of cell
@@ -593,12 +608,14 @@ def _load_geotiff_dem_wall_pts(
     thresh_abs = dmin + thresh_norm * (dmax - dmin)
     direction = "<=" if use_floor else ">="
     label = "floor" if use_floor else "wall-top"
-    print(f"    {len(wall_pts)} {label} cells (norm{direction}{thresh_norm:.2f}, ={thresh_abs:.3f} m abs)")
+    print(f"    {len(wall_pts)} {label} cells (center-norm{direction}{thresh_norm:.2f}, "
+          f"center range [{dmin:.3f},{dmax:.3f}] m, thresh={thresh_abs:.3f} m abs)")
     print(f"    Local extent: X=[{local_x.min():.2f},{local_x.max():.2f}] "
           f"Y=[{local_y.min():.2f},{local_y.max():.2f}]")
 
     # Debug image: normalized grayscale DEM (0→black, 1→white) + wall-top in red
-    img8 = (dem_norm * 255).astype(np.uint8)
+    # dem_norm is NaN outside center region; treat as 0 for display
+    img8 = (np.nan_to_num(dem_norm, nan=0.0) * 255).astype(np.uint8)
     dem_img = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
     dem_img[wr, wc] = (0, 0, 255)
 
