@@ -1,0 +1,32 @@
+# Point cloud data
+*.bin
+*.ply
+*.las
+*.laz
+*.e57
+*.pts
+
+# Mesh outputs
+*.obj
+*.mtl
+
+# USDZ/USD source files (large)
+*.usdz
+*.usdc
+*.usda
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Backup files
+*-backup.json
+
+# Large data directories
+Data/Pgram_Job_*/
+Data/Final_Volumes/

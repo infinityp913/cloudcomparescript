@@ -6,7 +6,8 @@ import requests
 import matplotlib
 import os
 
-json_filepath = "example-17000.json"
+import sys as _sys
+json_filepath = _sys.argv[1] if len(_sys.argv) > 1 else "example-17000.json"
 
 with open(json_filepath, "r") as f:
     job_data = json.load(f)

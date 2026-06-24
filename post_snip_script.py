@@ -3,12 +3,13 @@ import cloudComPy as cc
 import cloudComPy.PoissonRecon
 import gc
 import os
+import sys
 import math
 
 from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project
 import glob
 
-json_filepath = "example.json"
+json_filepath = sys.argv[1] if len(sys.argv) > 1 else "example.json"
 POINT_CLOUD_DIR = "Data"
 
 with open(json_filepath, "r") as f:
@@ -49,7 +50,7 @@ def get_su_number_from_filename(filename):
     parts = filename.lower().split("_cleaned_su_")
     if len(parts) > 1:
         su_part = parts[1].replace(".bin", "")
-        if su_part.isdigit():
+        if su_part:
             return su_part
     print(f"Warning: SU number not found in filename {filename}")
     return None
@@ -134,6 +135,48 @@ def find_top_bottom_cloud_pairs(point_cloud_dir):
     return pairs
 
 
+def filter_by_c2c_distance(cloud, low_percentile=10):
+    """
+    Remove points whose C2C distance scalar field value falls below
+    `low_percentile` percent of the distribution. These low-distance fringe
+    points sit where the top/bottom surfaces nearly meet at the SU boundary
+    and cause Poisson to fill in phantom bubble surfaces.
+
+    Returns a filtered clone, or the original cloud if filtering isn't possible.
+    """
+    n_sf = cloud.getNumberOfScalarFields()
+    if n_sf == 0:
+        print(f"  C2C filter: no scalar fields on {cloud.getName()}, skipping")
+        return cloud
+
+    # The C2C distance field is the first scalar field added by pre_snip
+    sf_idx = 0
+    cloud.setCurrentOutScalarField(sf_idx)
+    sf = cloud.getScalarField(sf_idx)
+    sf_name = sf.getName()
+
+    import numpy as np
+    vals = sf.toNpArray()
+    finite = vals[np.isfinite(vals)]
+    if len(finite) == 0:
+        print(f"  C2C filter: all values non-finite on {cloud.getName()}, skipping")
+        return cloud
+
+    threshold = float(np.percentile(finite, low_percentile))
+    sf_max    = float(finite.max())
+    print(f"  C2C filter '{sf_name}': keeping >{threshold:.4f} m "
+          f"(p{low_percentile} of [{finite.min():.4f}, {sf_max:.4f}])")
+
+    filtered = cc.filterBySFValue(threshold, sf_max * 1.01, cloud)
+    if filtered is None or filtered.size() == 0:
+        print(f"  C2C filter: result empty, using original {cloud.getName()}")
+        return cloud
+
+    filtered.setName(cloud.getName() + "_c2c_filtered")
+    print(f"  C2C filter: {cloud.size()} → {filtered.size()} pts")
+    return filtered
+
+
 def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path):
     top_base_name = os.path.basename(top_cloud_path).split("_cleaned_su_")[0]
     bottom_base_name = os.path.basename(bottom_cloud_path).split("_cleaned_su_")[0]
@@ -160,6 +203,10 @@ def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path):
     except Exception as e:
         print(f"Error loading clouds: {e}")
         return None, None, None
+
+    # Filter out low-C2C-distance fringe points that cause Poisson bubble artifacts
+    top_cloud    = filter_by_c2c_distance(top_cloud,    low_percentile=25)
+    bottom_cloud = filter_by_c2c_distance(bottom_cloud, low_percentile=25)
 
     # Check if clouds have normals
     if not top_cloud.hasNormals():

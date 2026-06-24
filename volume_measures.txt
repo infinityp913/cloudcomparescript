@@ -86,3 +86,13 @@ SU17007	30539.51	-0.2693824499605531	No issues detected.
 SU17012	34036.29	-0.2658759661089134	No issues detected.
 SU17015	518603.28	0.2630947133722144	There might be a hole in the mesh.
 SU17015	126514.79	0.11860840253448117	There might be a hole in the mesh.
+SU17015	126514.79	0.11860840253448117	There might be a hole in the mesh.
+SUNone	41381.46	0.0029676023456035325	There might be a hole in the mesh.
+SU22044-22048	41381.46	0.0029676023456035325	There might be a hole in the mesh.
+SU22044-22048	54560.16	0.004033282800504958	There might be a hole in the mesh.
+SU22044-22048	84333.72	0.004149665419115234	There might be a hole in the mesh.
+SU22044-22048	17186.51	0.0015381306018142254	There might be a hole in the mesh.
+SU22044-22048	17186.51	0.0015381306018142254	There might be a hole in the mesh.
+SU22000_su1	152762432.44	5.005340982175456	There might be a hole in the mesh.
+SU22000_su1	229688047.41	4.597468163981355	There might be a hole in the mesh.
+SU22044-22048	17186.51	0.0015381306018142254	There might be a hole in the mesh.

@@ -3,13 +3,15 @@ import cv2
 import numpy as np
 import json
 import os
+import sys
 import glob
 
 from pre_snip_script import DATA_DIR, find_mesh_by_pgram_job, INPUT_MESH_PATH
+import auto_snip_lidar
 
 cc.initCC()
 
-json_filepath = "example-17000.json"
+json_filepath = sys.argv[1] if len(sys.argv) > 1 else "example-17000.json"
 
 with open(json_filepath, "r") as f:
     job_data = json.load(f)
@@ -361,40 +363,89 @@ if __name__ == "__main__":
         print(f"  Render saved: {render_path}")
 
         for annotation_path in annotations:
-            su_number = parse_su_number(annotation_path)
-            print(f"\n  Processing SU {su_number} from {annotation_path}...")
+            ext = os.path.splitext(annotation_path)[1].lower()
+            print(f"\n  Processing annotation: {annotation_path}")
 
-            img_bgr = cv2.imread(annotation_path)
-            if img_bgr is None:
-                print(f"  Error: cannot read image {annotation_path}")
-                continue
+            # ------------------------------------------------------------------
+            # Branch A: USDZ (LiDAR scan with physically-painted yellow annotation)
+            # ------------------------------------------------------------------
+            if ext == '.usdz':
+                try:
+                    lidar = auto_snip_lidar.process_usdz(annotation_path)
+                except Exception as e:
+                    print(f"  Error processing USDZ: {e}")
+                    continue
 
-            # Extract yellow polygon in annotation pixel space
-            yellow_px = extract_polygon_for_color(img_bgr, "yellow")
-            if yellow_px is None:
-                print(f"  Error: no yellow polygon found in {annotation_path}")
-                continue
-            print(f"  Yellow polygon: {len(yellow_px)} hull vertices")
+                su_number = lidar["su_name"]
+                print(f"  SU name from USDZ: {su_number}")
 
-            # PCA-based similarity transform: annotation pixels -> world coords
-            try:
-                transform, debug_ann = find_annotation_to_world_transform(
-                    img_bgr, render_img, render_world_bbox, yellow_px
+                # Save LiDAR debug images
+                cv2.imwrite(os.path.join(output_dir, "debug_lidar_render.png"),
+                            lidar["lidar_render"])
+                auto_snip_lidar.save_lidar_debug(
+                    lidar["lidar_render"], lidar["xz_polygon"],
+                    lidar["lidar_xz_bbox"],
+                    os.path.join(output_dir, f"debug_SU{su_number}_lidar_yellow.png"),
                 )
-            except RuntimeError as e:
-                print(f"  Error: {e}")
+
+                # Register LiDAR render to PLY render via PCA footprint alignment
+                try:
+                    transform, debug_reg, reg_note = auto_snip_lidar.register_lidar_to_ply_world(
+                        lidar["lidar_render"], lidar["lidar_xz_bbox"],
+                        render_img, render_world_bbox,
+                        lidar["xz_polygon"],
+                    )
+                except RuntimeError as e:
+                    print(f"  Registration failed: {e}")
+                    continue
+
+                reg_path = os.path.join(output_dir, f"debug_SU{su_number}_registration.png")
+                cv2.imwrite(reg_path, debug_reg)
+                print(f"  Registration debug ({reg_note}): {reg_path}")
+
+                yellow_world = transform(lidar["xz_polygon"])
+
+            # ------------------------------------------------------------------
+            # Branch B: PNG annotation (top-down photo with painted color lines)
+            # ------------------------------------------------------------------
+            elif ext == '.png':
+                su_number = parse_su_number(annotation_path)
+                print(f"  SU number: {su_number}")
+
+                img_bgr = cv2.imread(annotation_path)
+                if img_bgr is None:
+                    print(f"  Error: cannot read {annotation_path}")
+                    continue
+
+                yellow_px = extract_polygon_for_color(img_bgr, "yellow")
+                if yellow_px is None:
+                    print(f"  Error: no yellow polygon found in {annotation_path}")
+                    continue
+                print(f"  Yellow polygon: {len(yellow_px)} hull vertices")
+
+                try:
+                    transform, debug_ann = find_annotation_to_world_transform(
+                        img_bgr, render_img, render_world_bbox, yellow_px
+                    )
+                except RuntimeError as e:
+                    print(f"  Error: {e}")
+                    continue
+
+                cv2.imwrite(os.path.join(output_dir, f"debug_SU{su_number}_annotation.png"), debug_ann)
+                yellow_world = transform(yellow_px)
+
+            else:
+                print(f"  Unsupported annotation format '{ext}', skipping.")
                 continue
 
-            ann_path = os.path.join(output_dir, f"debug_SU{su_number}_annotation.png")
-            cv2.imwrite(ann_path, debug_ann)
-
-            # Transform yellow polygon to world coords
-            yellow_world = transform(yellow_px)
+            # ------------------------------------------------------------------
+            # Common: print world extent, save snip reference, crop, save
+            # ------------------------------------------------------------------
             print(f"  Yellow polygon world extent: "
                   f"X=[{yellow_world[:,0].min():.3f}, {yellow_world[:,0].max():.3f}]  "
                   f"Y=[{yellow_world[:,1].min():.3f}, {yellow_world[:,1].max():.3f}]")
 
-            # Save snip reference: full render (left) | dimmed render + highlighted crop (right)
+            # Snip reference: full render (left) | dimmed render + highlighted crop (right)
             rH, rW = render_img.shape[:2]
             rx0, ry0, rx1, ry1 = render_world_bbox
             render_px = np.empty((len(yellow_world), 2), dtype=int)
@@ -412,7 +463,7 @@ if __name__ == "__main__":
             cv2.imwrite(ref_path, snip_ref)
             print(f"  Snip reference saved: {ref_path}")
 
-            # Crop both clouds
+            # Crop both clouds to the yellow polygon
             print("  Cropping top cloud...")
             top_cropped = crop_cloud_by_polygon_2d(top_cloud, yellow_world)
             print("  Cropping bottom cloud...")
