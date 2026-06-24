@@ -435,80 +435,154 @@ def register_lidar_to_ply_world(
 #   5. Optionally save DEM debug images for manual inspection.
 # ---------------------------------------------------------------------------
 
-def _compute_dem_mask(
-    pts_3d: np.ndarray,
-    horiz_idx: tuple = (0, 2),
-    vert_idx: int = 1,
-    cell_size: float = 0.05,
+def _compute_lidar_dem_wall_pts(
+    lidar_pts: np.ndarray,
+    cell_size: float = 0.02,
     pct: float = 60,
 ) -> tuple:
     """
-    Compute a height grid and return world coords of above-percentile cells.
-
-    Args:
-        pts_3d:    (N, 3) float array
-        horiz_idx: column indices of the two horizontal axes (default: X=0, Z=2 for LiDAR)
-        vert_idx:  column index of the vertical (elevation) axis (default: Y=1 for LiDAR)
-        cell_size: grid resolution in metres (default 5 cm)
-        pct:       percentile threshold to isolate wall tops (default 60th)
+    Build a height grid from LiDAR vertices (Y-up) and return XZ positions
+    of wall-top cells (above pct-th percentile elevation).
 
     Returns:
-        wall_pts:  (K, 2) world coords (in horiz axes) of above-threshold cells
-        dem:       (H, W) height grid (max elevation per cell; NaN where empty)
-        origin:    (h0, v0) world origin of the grid
+        wall_pts: (K, 2) XZ coords in LiDAR local space
+        dem:      (H, W) float32 height grid (NaN where empty)
+        origin:   (x0, z0) world origin of grid
     """
-    h   = pts_3d[:, horiz_idx[0]].astype(np.float32)
-    v   = pts_3d[:, horiz_idx[1]].astype(np.float32)
-    elv = pts_3d[:, vert_idx    ].astype(np.float32)
+    x   = lidar_pts[:, 0].astype(np.float32)
+    z   = lidar_pts[:, 2].astype(np.float32)
+    elv = lidar_pts[:, 1].astype(np.float32)   # Y = up
 
-    h0, v0 = float(h.min()), float(v.min())
-    col = ((h - h0) / cell_size).astype(np.int32)
-    row = ((v - v0) / cell_size).astype(np.int32)
+    x0, z0 = float(x.min()), float(z.min())
+    col = ((x - x0) / cell_size).astype(np.int32)
+    row = ((z - z0) / cell_size).astype(np.int32)
     W, H = int(col.max()) + 1, int(row.max()) + 1
 
     flat = np.full(H * W, -np.inf, dtype=np.float32)
     np.maximum.at(flat, row * W + col, elv)
     dem = flat.reshape(H, W)
-
     valid = dem > -np.inf
     dem[~valid] = np.nan
+
     if not valid.any():
-        return np.empty((0, 2)), dem, (h0, v0)
+        return np.empty((0, 2)), dem, (x0, z0)
 
     thresh = float(np.nanpercentile(dem, pct))
     wr, wc = np.where(valid & (dem >= thresh))
-    wall_pts = np.stack([h0 + wc * cell_size, v0 + wr * cell_size], axis=1)
-    return wall_pts, dem, (h0, v0)
+    wall_pts = np.stack([x0 + wc * cell_size, z0 + wr * cell_size], axis=1)
+    return wall_pts, dem, (x0, z0)
+
+
+def _load_geotiff_dem_wall_pts(
+    dem_path: str,
+    ply_world_bbox: tuple,
+    wall_pct: float = 60,
+) -> tuple:
+    """
+    Load a GeoTIFF DEM (UTM), threshold at wall_pct percentile to get wall-top
+    cells, and return their positions converted to PLY local coordinates.
+
+    The DEM is in absolute UTM; the PLY cloud uses a local origin. Both cover
+    the same physical area, so the offset is:
+        utm_offset = (dem_utm_x_min - ply_x_min, dem_utm_y_min - ply_y_min)
+
+    Args:
+        dem_path:       path to GeoTIFF DEM in UTM
+        ply_world_bbox: (x0, y0, x1, y1) PLY local bbox from render_topdown_image
+
+    Returns:
+        wall_pts: (K, 2) wall-top positions in PLY local XY coords
+        dem_img:  uint8 BGR debug image (grayscale DEM + red wall-top cells)
+    """
+    from osgeo import gdal
+    gdal.UseExceptions()
+
+    ds  = gdal.Open(dem_path)
+    gt  = ds.GetGeoTransform()   # (x0_utm, px_w, 0, y0_utm_top, 0, px_h<0)
+    W_d = ds.RasterXSize
+    H_d = ds.RasterYSize
+
+    band   = ds.GetRasterBand(1)
+    nodata = band.GetNoDataValue()
+    dem    = band.ReadAsArray().astype(np.float32)  # (H, W)
+    if nodata is not None:
+        dem[dem == nodata] = np.nan
+
+    # UTM extent corners
+    dem_utm_x0   = gt[0]
+    dem_utm_y_top = gt[3]                          # max northing (top row)
+    dem_utm_y_bot = gt[3] + gt[5] * H_d           # min northing (bottom row)
+
+    # PLY local extent (same physical area)
+    ply_x0, ply_y0, ply_x1, ply_y1 = ply_world_bbox
+
+    # Offset: UTM_val - offset = local_val
+    # Both X and Y increase in the same direction (east / north)
+    offset_x = dem_utm_x0 - ply_x0
+    offset_y = dem_utm_y_bot - ply_y0
+
+    print(f"  GeoTIFF DEM: {W_d}×{H_d} px, cell={gt[1]*100:.3f} cm")
+    print(f"    UTM extent: X=[{dem_utm_x0:.2f},{dem_utm_x0+gt[1]*W_d:.2f}] "
+          f"Y=[{dem_utm_y_bot:.2f},{dem_utm_y_top:.2f}]")
+    print(f"    UTM→local offset: dx={offset_x:.3f}  dy={offset_y:.3f}")
+
+    # Threshold
+    valid  = ~np.isnan(dem)
+    thresh = float(np.nanpercentile(dem, wall_pct))
+    wr, wc = np.where(valid & (dem >= thresh))
+
+    # Pixel (row, col) → UTM → PLY local
+    utm_x   = dem_utm_x0   + wc * gt[1]   # left edge of cell
+    utm_y   = dem_utm_y_top + wr * gt[5]  # top edge of cell (gt[5] < 0 → decreasing)
+    local_x = utm_x - offset_x
+    local_y = utm_y - offset_y
+
+    wall_pts = np.stack([local_x, local_y], axis=1)
+    print(f"    {len(wall_pts)} wall-top cells (>{wall_pct}th pct, thresh={thresh:.3f} m)")
+    print(f"    Local extent: X=[{local_x.min():.2f},{local_x.max():.2f}] "
+          f"Y=[{local_y.min():.2f},{local_y.max():.2f}]")
+
+    # Debug image: grayscale DEM with wall-top in red
+    valid_n = ~np.isnan(dem)
+    dmin, dmax = float(np.nanmin(dem)), float(np.nanmax(dem))
+    gray = np.zeros((H_d, W_d), dtype=np.float32)
+    gray[valid_n] = (dem[valid_n] - dmin) / max(dmax - dmin, 1e-6)
+    img8 = (gray * 255).astype(np.uint8)
+    dem_img = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+    dem_img[wr, wc] = (0, 0, 255)
+
+    return wall_pts, dem_img
 
 
 def register_lidar_to_ply_world_dem(
     lidar_pts: np.ndarray,
     lidar_xz_bbox: tuple,
-    ply_pts: np.ndarray,
+    dem_path: str,
     ply_world_bbox: tuple,
     lidar_render: np.ndarray,
     ply_render: np.ndarray,
     xz_polygon: np.ndarray,
-    cell_size: float = 0.05,
+    lidar_cell_size: float = 0.02,
     wall_pct: float = 60,
 ) -> tuple:
     """
     DEM-based PCA similarity transform: LiDAR XZ → PLY world XY.
 
-    Height-grid PCA on wall-top cells (top wall_pct% elevation) is more stable
-    than RGB-footprint PCA because wall edges appear at consistent heights
-    regardless of scan extent or texture.
+    Loads the photogrammetry GeoTIFF DEM for the top job, extracts wall-top
+    cells (highest wall_pct% of elevation), and aligns their horizontal
+    footprint to the LiDAR DEM footprint via PCA. This is more stable than
+    RGB-footprint PCA because wall heights are physically consistent.
 
     Args:
-        lidar_pts:    (V, 3) float32 from process_usdz, Y-up
-        lidar_xz_bbox: (x0, z0, x1, z1) LiDAR local coords
-        ply_pts:      (N, 3) float from top_cloud.toNpArrayCopy(), Z-up
-        ply_world_bbox: (x0, y0, x1, y1) PLY world XY extent
-        lidar_render:  BGR top-down render of LiDAR (for debug)
-        ply_render:    BGR top-down render of PLY (for debug)
-        xz_polygon:   (M, 2) yellow annotation polygon in LiDAR XZ space
-        cell_size:    DEM grid resolution in metres (default 5 cm)
-        wall_pct:     percentile threshold for wall top (default 60)
+        lidar_pts:       (V, 3) float32 from process_usdz, Y-up
+        lidar_xz_bbox:   (x0, z0, x1, z1) LiDAR local coords
+        dem_path:        path to GeoTIFF DEM for the top PLY job (UTM Zone 32N)
+        ply_world_bbox:  (x0, y0, x1, y1) PLY local XY extent (from render_topdown_image)
+        lidar_render:    BGR top-down render of LiDAR (for debug)
+        ply_render:      BGR top-down render of PLY (for debug)
+        xz_polygon:      (M, 2) yellow annotation polygon in LiDAR XZ space
+        lidar_cell_size: LiDAR DEM grid resolution in metres (default 2 cm)
+        wall_pct:        percentile threshold for wall tops (default 60)
 
     Returns:
         transform_fn: callable (N,2) LiDAR XZ → (N,2) PLY world XY
@@ -517,34 +591,33 @@ def register_lidar_to_ply_world_dem(
         dem_debug:    dict with 'lidar_dem_img' and 'ply_dem_img' uint8 arrays
     """
     # ------------------------------------------------------------------
-    # LiDAR DEM: horizontal = (X, Z), vertical = Y
+    # LiDAR DEM from raw vertices (Y-up, XZ horizontal, local metres)
     # ------------------------------------------------------------------
-    lidar_wall, lidar_dem, lidar_orig = _compute_dem_mask(
-        lidar_pts, horiz_idx=(0, 2), vert_idx=1, cell_size=cell_size, pct=wall_pct)
-    print(f"  LiDAR DEM: {lidar_dem.shape[1]}×{lidar_dem.shape[0]} cells, "
+    lidar_wall, lidar_dem, lidar_orig = _compute_lidar_dem_wall_pts(
+        lidar_pts, cell_size=lidar_cell_size, pct=wall_pct)
+    lH, lW = lidar_dem.shape
+    print(f"  LiDAR DEM: {lW}×{lH} cells at {lidar_cell_size*100:.0f} cm, "
           f"{len(lidar_wall)} wall-top cells (>{wall_pct}th pct)")
 
-    # ------------------------------------------------------------------
-    # PLY DEM: horizontal = (X, Y), vertical = Z
-    # ------------------------------------------------------------------
-    ply_wall, ply_dem, ply_orig = _compute_dem_mask(
-        ply_pts, horiz_idx=(0, 1), vert_idx=2, cell_size=cell_size, pct=wall_pct)
-    print(f"  PLY DEM:   {ply_dem.shape[1]}×{ply_dem.shape[0]} cells, "
-          f"{len(ply_wall)} wall-top cells (>{wall_pct}th pct)")
-
-    if len(lidar_wall) < 10 or len(ply_wall) < 10:
-        raise RuntimeError(
-            f"DEM registration: too few wall-top cells "
-            f"(LiDAR={len(lidar_wall)}, PLY={len(ply_wall)})"
-        )
+    if len(lidar_wall) < 10:
+        raise RuntimeError("DEM registration: too few LiDAR wall-top cells")
 
     # ------------------------------------------------------------------
-    # PCA on wall-top horizontal positions (world metres, not pixels)
+    # PLY DEM from GeoTIFF, converted to PLY local XY coords
+    # ------------------------------------------------------------------
+    ply_wall, ply_dem_img = _load_geotiff_dem_wall_pts(
+        dem_path, ply_world_bbox, wall_pct=wall_pct)
+
+    if len(ply_wall) < 10:
+        raise RuntimeError("DEM registration: too few PLY wall-top cells from GeoTIFF")
+
+    # ------------------------------------------------------------------
+    # PCA on wall-top positions (both already in physical metres)
     # ------------------------------------------------------------------
     def _pca2(pts):
         center = pts.mean(axis=0)
         cov    = np.cov(pts.T)
-        eigval, eigvec = np.linalg.eigh(cov)  # ascending
+        eigval, eigvec = np.linalg.eigh(cov)
         main   = eigvec[:, -1]
         angle  = float(np.degrees(np.arctan2(main[1], main[0])))
         return center, angle, float(np.sqrt(eigval[-1])), float(np.sqrt(eigval[0]))
@@ -552,6 +625,7 @@ def register_lidar_to_ply_world_dem(
     cx_li, ang_li, sml_li, spr_li = _pca2(lidar_wall)
     cx_pl, ang_pl, sml_pl, spr_pl = _pca2(ply_wall)
 
+    # Scale: GeoTIFF DEM is accurate photogrammetry; LiDAR may differ slightly
     scale = (sml_pl / sml_li + spr_pl / spr_li) / 2
 
     print(f"  DEM PCA LiDAR XZ: center=({cx_li[0]:.3f},{cx_li[1]:.3f}) "
@@ -561,8 +635,7 @@ def register_lidar_to_ply_world_dem(
     print(f"  DEM scale: {scale:.4f}")
 
     # ------------------------------------------------------------------
-    # Build similarity transform: LiDAR XZ → PLY world XY
-    # Axes: LiDAR (X_l, Z_l) maps to PLY (X_p, Y_p)
+    # Similarity transform: LiDAR (X_l, Z_l) → PLY local (X_p, Y_p)
     # ------------------------------------------------------------------
     def _make_M(rot_deg):
         r = np.radians(rot_deg)
@@ -614,28 +687,21 @@ def register_lidar_to_ply_world_dem(
     cv2.polylines(debug_img, [np.stack([ppx, ppy], axis=1).reshape(-1, 1, 2)],
                   isClosed=True, color=(255, 0, 255), thickness=4)
 
-    # ------------------------------------------------------------------
-    # DEM visualisations for inspection
-    # ------------------------------------------------------------------
-    def _dem_to_img(dem, wall_pts, origin, cs):
-        valid = ~np.isnan(dem)
-        vmin  = float(np.nanmin(dem))
-        vmax  = float(np.nanmax(dem))
-        dem_norm = np.zeros_like(dem)
-        dem_norm[valid] = (dem[valid] - vmin) / max(vmax - vmin, 1e-6)
-        img8 = (dem_norm * 255).astype(np.uint8)
-        rgb  = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
-        # Draw wall-top cells in red
-        H, W = dem.shape
-        h0, v0 = origin
-        wc = np.clip(((wall_pts[:, 0] - h0) / cs).astype(np.int32), 0, W - 1)
-        wr = np.clip(((wall_pts[:, 1] - v0) / cs).astype(np.int32), 0, H - 1)
-        rgb[wr, wc] = (0, 0, 255)
-        return rgb
+    # LiDAR DEM debug image
+    lx0, lz0 = lidar_orig
+    valid_l = ~np.isnan(lidar_dem)
+    dmin, dmax = float(np.nanmin(lidar_dem)), float(np.nanmax(lidar_dem))
+    gray_l = np.zeros_like(lidar_dem)
+    gray_l[valid_l] = (lidar_dem[valid_l] - dmin) / max(dmax - dmin, 1e-6)
+    img8_l = (gray_l * 255).astype(np.uint8)
+    lidar_dem_img = cv2.cvtColor(img8_l, cv2.COLOR_GRAY2BGR)
+    wc_l = np.clip(((lidar_wall[:, 0] - lx0) / lidar_cell_size).astype(np.int32), 0, lW - 1)
+    wr_l = np.clip(((lidar_wall[:, 1] - lz0) / lidar_cell_size).astype(np.int32), 0, lH - 1)
+    lidar_dem_img[wr_l, wc_l] = (0, 0, 255)
 
     dem_debug = {
-        "lidar_dem_img": _dem_to_img(lidar_dem, lidar_wall, lidar_orig, cell_size),
-        "ply_dem_img":   _dem_to_img(ply_dem,   ply_wall,   ply_orig,   cell_size),
+        "lidar_dem_img": lidar_dem_img,
+        "ply_dem_img":   ply_dem_img,
     }
 
     return transform_fn, debug_img, note, dem_debug

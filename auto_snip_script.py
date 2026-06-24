@@ -388,20 +388,29 @@ if __name__ == "__main__":
                     os.path.join(output_dir, f"debug_SU{su_number}_lidar_yellow.png"),
                 )
 
-                # Get PLY 3D points for DEM computation (already loaded for render)
-                ply_pts_3d = top_cloud.toNpArrayCopy()  # (N, 3), Z-up
+                # Find GeoTIFF DEM for the top job
+                dem_path = os.path.join(DATA_DIR, "DEMs", f"{top_id}_dem.tif")
+                use_dem = os.path.exists(dem_path)
+                if use_dem:
+                    print(f"  DEM found: {dem_path}")
+                else:
+                    print(f"  No GeoTIFF DEM at {dem_path} — will use RGB footprint PCA")
 
                 # Register LiDAR to PLY world via DEM-based PCA (wall-height alignment)
-                try:
+                if use_dem:
+                  try:
                     transform, debug_reg, reg_note, dem_debug = \
                         auto_snip_lidar.register_lidar_to_ply_world_dem(
                             lidar["lidar_pts"], lidar["lidar_xz_bbox"],
-                            ply_pts_3d, render_world_bbox,
+                            dem_path, render_world_bbox,
                             lidar["lidar_render"], render_img,
                             lidar["xz_polygon"],
                         )
-                except RuntimeError as e:
-                    print(f"  DEM registration failed ({e}), falling back to RGB footprint PCA")
+                  except RuntimeError as e:
+                    print(f"  DEM registration failed: {e} — falling back to RGB footprint PCA")
+                    use_dem = False
+
+                if not use_dem:
                     try:
                         transform, debug_reg, reg_note = auto_snip_lidar.register_lidar_to_ply_world(
                             lidar["lidar_render"], lidar["lidar_xz_bbox"],
@@ -410,7 +419,7 @@ if __name__ == "__main__":
                         )
                         dem_debug = {}
                     except RuntimeError as e2:
-                        print(f"  Fallback registration also failed: {e2}")
+                        print(f"  Registration failed: {e2}")
                         continue
 
                 reg_path = os.path.join(output_dir, f"debug_SU{su_number}_registration.png")
