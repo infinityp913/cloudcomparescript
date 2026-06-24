@@ -287,6 +287,7 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
                 "xz_pts":        xz_pts,
                 "lidar_render":  img,
                 "lidar_xz_bbox": (x0, z0, x1, z1),
+                "lidar_pts":     pts,          # (V, 3) float32, Y-up, for DEM registration
                 "su_name":       su_name,
             }
 
@@ -415,6 +416,229 @@ def register_lidar_to_ply_world(
                   isClosed=True, color=(0, 255, 0), thickness=4)
 
     return transform_fn, debug_img, note
+
+
+# ---------------------------------------------------------------------------
+# DEM-based registration: height-grid PCA → LiDAR XZ → PLY world XY
+#
+# RGB-footprint PCA aligns the overall scan outline, which can shift if the
+# LiDAR scan and PLY point cloud have different extents (e.g. the LiDAR scan
+# includes surrounding area outside the trench). DEM PCA is more stable: it
+# aligns the *wall-top* structure — the highest-elevation cells in each scan —
+# which corresponds to the same physical edges regardless of scan extent.
+#
+# Pipeline:
+#   1. Bin both point clouds into 5 cm height grids.
+#   2. Threshold each grid at the 60th percentile elevation (wall tops).
+#   3. PCA on the XZ/XY positions of above-threshold cells.
+#   4. Similarity transform from matching PCAs; try 180° ambiguity.
+#   5. Optionally save DEM debug images for manual inspection.
+# ---------------------------------------------------------------------------
+
+def _compute_dem_mask(
+    pts_3d: np.ndarray,
+    horiz_idx: tuple = (0, 2),
+    vert_idx: int = 1,
+    cell_size: float = 0.05,
+    pct: float = 60,
+) -> tuple:
+    """
+    Compute a height grid and return world coords of above-percentile cells.
+
+    Args:
+        pts_3d:    (N, 3) float array
+        horiz_idx: column indices of the two horizontal axes (default: X=0, Z=2 for LiDAR)
+        vert_idx:  column index of the vertical (elevation) axis (default: Y=1 for LiDAR)
+        cell_size: grid resolution in metres (default 5 cm)
+        pct:       percentile threshold to isolate wall tops (default 60th)
+
+    Returns:
+        wall_pts:  (K, 2) world coords (in horiz axes) of above-threshold cells
+        dem:       (H, W) height grid (max elevation per cell; NaN where empty)
+        origin:    (h0, v0) world origin of the grid
+    """
+    h   = pts_3d[:, horiz_idx[0]].astype(np.float32)
+    v   = pts_3d[:, horiz_idx[1]].astype(np.float32)
+    elv = pts_3d[:, vert_idx    ].astype(np.float32)
+
+    h0, v0 = float(h.min()), float(v.min())
+    col = ((h - h0) / cell_size).astype(np.int32)
+    row = ((v - v0) / cell_size).astype(np.int32)
+    W, H = int(col.max()) + 1, int(row.max()) + 1
+
+    flat = np.full(H * W, -np.inf, dtype=np.float32)
+    np.maximum.at(flat, row * W + col, elv)
+    dem = flat.reshape(H, W)
+
+    valid = dem > -np.inf
+    dem[~valid] = np.nan
+    if not valid.any():
+        return np.empty((0, 2)), dem, (h0, v0)
+
+    thresh = float(np.nanpercentile(dem, pct))
+    wr, wc = np.where(valid & (dem >= thresh))
+    wall_pts = np.stack([h0 + wc * cell_size, v0 + wr * cell_size], axis=1)
+    return wall_pts, dem, (h0, v0)
+
+
+def register_lidar_to_ply_world_dem(
+    lidar_pts: np.ndarray,
+    lidar_xz_bbox: tuple,
+    ply_pts: np.ndarray,
+    ply_world_bbox: tuple,
+    lidar_render: np.ndarray,
+    ply_render: np.ndarray,
+    xz_polygon: np.ndarray,
+    cell_size: float = 0.05,
+    wall_pct: float = 60,
+) -> tuple:
+    """
+    DEM-based PCA similarity transform: LiDAR XZ → PLY world XY.
+
+    Height-grid PCA on wall-top cells (top wall_pct% elevation) is more stable
+    than RGB-footprint PCA because wall edges appear at consistent heights
+    regardless of scan extent or texture.
+
+    Args:
+        lidar_pts:    (V, 3) float32 from process_usdz, Y-up
+        lidar_xz_bbox: (x0, z0, x1, z1) LiDAR local coords
+        ply_pts:      (N, 3) float from top_cloud.toNpArrayCopy(), Z-up
+        ply_world_bbox: (x0, y0, x1, y1) PLY world XY extent
+        lidar_render:  BGR top-down render of LiDAR (for debug)
+        ply_render:    BGR top-down render of PLY (for debug)
+        xz_polygon:   (M, 2) yellow annotation polygon in LiDAR XZ space
+        cell_size:    DEM grid resolution in metres (default 5 cm)
+        wall_pct:     percentile threshold for wall top (default 60)
+
+    Returns:
+        transform_fn: callable (N,2) LiDAR XZ → (N,2) PLY world XY
+        debug_img:    BGR image: PLY render with transformed polygon in magenta
+        note:         str describing the chosen orientation
+        dem_debug:    dict with 'lidar_dem_img' and 'ply_dem_img' uint8 arrays
+    """
+    # ------------------------------------------------------------------
+    # LiDAR DEM: horizontal = (X, Z), vertical = Y
+    # ------------------------------------------------------------------
+    lidar_wall, lidar_dem, lidar_orig = _compute_dem_mask(
+        lidar_pts, horiz_idx=(0, 2), vert_idx=1, cell_size=cell_size, pct=wall_pct)
+    print(f"  LiDAR DEM: {lidar_dem.shape[1]}×{lidar_dem.shape[0]} cells, "
+          f"{len(lidar_wall)} wall-top cells (>{wall_pct}th pct)")
+
+    # ------------------------------------------------------------------
+    # PLY DEM: horizontal = (X, Y), vertical = Z
+    # ------------------------------------------------------------------
+    ply_wall, ply_dem, ply_orig = _compute_dem_mask(
+        ply_pts, horiz_idx=(0, 1), vert_idx=2, cell_size=cell_size, pct=wall_pct)
+    print(f"  PLY DEM:   {ply_dem.shape[1]}×{ply_dem.shape[0]} cells, "
+          f"{len(ply_wall)} wall-top cells (>{wall_pct}th pct)")
+
+    if len(lidar_wall) < 10 or len(ply_wall) < 10:
+        raise RuntimeError(
+            f"DEM registration: too few wall-top cells "
+            f"(LiDAR={len(lidar_wall)}, PLY={len(ply_wall)})"
+        )
+
+    # ------------------------------------------------------------------
+    # PCA on wall-top horizontal positions (world metres, not pixels)
+    # ------------------------------------------------------------------
+    def _pca2(pts):
+        center = pts.mean(axis=0)
+        cov    = np.cov(pts.T)
+        eigval, eigvec = np.linalg.eigh(cov)  # ascending
+        main   = eigvec[:, -1]
+        angle  = float(np.degrees(np.arctan2(main[1], main[0])))
+        return center, angle, float(np.sqrt(eigval[-1])), float(np.sqrt(eigval[0]))
+
+    cx_li, ang_li, sml_li, spr_li = _pca2(lidar_wall)
+    cx_pl, ang_pl, sml_pl, spr_pl = _pca2(ply_wall)
+
+    scale = (sml_pl / sml_li + spr_pl / spr_li) / 2
+
+    print(f"  DEM PCA LiDAR XZ: center=({cx_li[0]:.3f},{cx_li[1]:.3f}) "
+          f"angle={ang_li:.1f}° main={sml_li:.3f}m perp={spr_li:.3f}m")
+    print(f"  DEM PCA PLY XY:   center=({cx_pl[0]:.3f},{cx_pl[1]:.3f}) "
+          f"angle={ang_pl:.1f}° main={sml_pl:.3f}m perp={spr_pl:.3f}m")
+    print(f"  DEM scale: {scale:.4f}")
+
+    # ------------------------------------------------------------------
+    # Build similarity transform: LiDAR XZ → PLY world XY
+    # Axes: LiDAR (X_l, Z_l) maps to PLY (X_p, Y_p)
+    # ------------------------------------------------------------------
+    def _make_M(rot_deg):
+        r = np.radians(rot_deg)
+        c, s = np.cos(r), np.sin(r)
+        tx = cx_pl[0] - scale * (c * cx_li[0] - s * cx_li[1])
+        ty = cx_pl[1] - scale * (s * cx_li[0] + c * cx_li[1])
+        return np.array([[scale * c, -scale * s, tx],
+                         [scale * s,  scale * c, ty],
+                         [0, 0, 1]], dtype=float)
+
+    def _apply(M, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M @ h.T).T[:, :2]
+
+    px0, py0, px1, py1 = ply_world_bbox
+
+    def _within_bounds(world_pts, margin=0.5):
+        ext_x = (px1 - px0) * margin
+        ext_y = (py1 - py0) * margin
+        return (world_pts[:, 0].min() > px0 - ext_x and
+                world_pts[:, 0].max() < px1 + ext_x and
+                world_pts[:, 1].min() > py0 - ext_y and
+                world_pts[:, 1].max() < py1 + ext_y)
+
+    rot_deg = ang_pl - ang_li
+    chosen_M, note = None, ""
+    for rotation in [rot_deg, rot_deg + 180]:
+        M = _make_M(rotation)
+        if _within_bounds(_apply(M, xz_polygon)):
+            chosen_M = M
+            note = f"DEM PCA rotation={rotation:.1f}°"
+            break
+    if chosen_M is None:
+        chosen_M = _make_M(rot_deg)
+        note = f"DEM PCA rotation={rot_deg:.1f}° (fallback — polygon outside PLY bounds)"
+    print(f"  {note}")
+
+    def transform_fn(xz_pts: np.ndarray) -> np.ndarray:
+        return _apply(chosen_M, xz_pts)
+
+    # ------------------------------------------------------------------
+    # Debug: PLY render with transformed polygon in magenta
+    # ------------------------------------------------------------------
+    pH, pW = ply_render.shape[:2]
+    world_poly = _apply(chosen_M, xz_polygon)
+    ppx = np.clip(((world_poly[:, 0] - px0) / (px1 - px0) * pW).astype(np.int32), 0, pW - 1)
+    ppy = np.clip(((py1 - world_poly[:, 1]) / (py1 - py0) * pH).astype(np.int32), 0, pH - 1)
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [np.stack([ppx, ppy], axis=1).reshape(-1, 1, 2)],
+                  isClosed=True, color=(255, 0, 255), thickness=4)
+
+    # ------------------------------------------------------------------
+    # DEM visualisations for inspection
+    # ------------------------------------------------------------------
+    def _dem_to_img(dem, wall_pts, origin, cs):
+        valid = ~np.isnan(dem)
+        vmin  = float(np.nanmin(dem))
+        vmax  = float(np.nanmax(dem))
+        dem_norm = np.zeros_like(dem)
+        dem_norm[valid] = (dem[valid] - vmin) / max(vmax - vmin, 1e-6)
+        img8 = (dem_norm * 255).astype(np.uint8)
+        rgb  = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+        # Draw wall-top cells in red
+        H, W = dem.shape
+        h0, v0 = origin
+        wc = np.clip(((wall_pts[:, 0] - h0) / cs).astype(np.int32), 0, W - 1)
+        wr = np.clip(((wall_pts[:, 1] - v0) / cs).astype(np.int32), 0, H - 1)
+        rgb[wr, wc] = (0, 0, 255)
+        return rgb
+
+    dem_debug = {
+        "lidar_dem_img": _dem_to_img(lidar_dem, lidar_wall, lidar_orig, cell_size),
+        "ply_dem_img":   _dem_to_img(ply_dem,   ply_wall,   ply_orig,   cell_size),
+    }
+
+    return transform_fn, debug_img, note, dem_debug
 
 
 # ---------------------------------------------------------------------------

@@ -388,20 +388,40 @@ if __name__ == "__main__":
                     os.path.join(output_dir, f"debug_SU{su_number}_lidar_yellow.png"),
                 )
 
-                # Register LiDAR render to PLY render via PCA footprint alignment
+                # Get PLY 3D points for DEM computation (already loaded for render)
+                ply_pts_3d = top_cloud.toNpArrayCopy()  # (N, 3), Z-up
+
+                # Register LiDAR to PLY world via DEM-based PCA (wall-height alignment)
                 try:
-                    transform, debug_reg, reg_note = auto_snip_lidar.register_lidar_to_ply_world(
-                        lidar["lidar_render"], lidar["lidar_xz_bbox"],
-                        render_img, render_world_bbox,
-                        lidar["xz_polygon"],
-                    )
+                    transform, debug_reg, reg_note, dem_debug = \
+                        auto_snip_lidar.register_lidar_to_ply_world_dem(
+                            lidar["lidar_pts"], lidar["lidar_xz_bbox"],
+                            ply_pts_3d, render_world_bbox,
+                            lidar["lidar_render"], render_img,
+                            lidar["xz_polygon"],
+                        )
                 except RuntimeError as e:
-                    print(f"  Registration failed: {e}")
-                    continue
+                    print(f"  DEM registration failed ({e}), falling back to RGB footprint PCA")
+                    try:
+                        transform, debug_reg, reg_note = auto_snip_lidar.register_lidar_to_ply_world(
+                            lidar["lidar_render"], lidar["lidar_xz_bbox"],
+                            render_img, render_world_bbox,
+                            lidar["xz_polygon"],
+                        )
+                        dem_debug = {}
+                    except RuntimeError as e2:
+                        print(f"  Fallback registration also failed: {e2}")
+                        continue
 
                 reg_path = os.path.join(output_dir, f"debug_SU{su_number}_registration.png")
                 cv2.imwrite(reg_path, debug_reg)
                 print(f"  Registration debug ({reg_note}): {reg_path}")
+
+                # Save DEM debug images if available
+                for key, img_arr in dem_debug.items():
+                    dem_path = os.path.join(output_dir, f"debug_SU{su_number}_{key}.png")
+                    cv2.imwrite(dem_path, img_arr)
+                    print(f"  Saved: {dem_path}")
 
                 yellow_world = transform(lidar["xz_polygon"])
 
