@@ -440,6 +440,7 @@ def _compute_lidar_dem_wall_pts(
     cell_size: float = 0.02,
     pct: float = 30,
     use_floor: bool = True,
+    center_frac: float = 1.0,
 ) -> tuple:
     """
     Build a height grid from LiDAR vertices (Y-up) and return XZ positions
@@ -449,6 +450,11 @@ def _compute_lidar_dem_wall_pts(
     percentile). With use_floor=True (default), selects cells in the BOTTOM
     pct% of the range — the trench floor. With use_floor=False, selects
     the TOP (100-pct)% — the wall/ceiling.
+
+    center_frac restricts selection to the central portion of the DEM grid
+    (1.0 = use all cells, default). The LiDAR floor can appear near the scan
+    boundary because the scanner is placed inside the trench — the lowest
+    elevation area (floor) is wherever the ground was closest to the sensor.
 
     Returns:
         wall_pts: (K, 2) XZ coords in LiDAR local space
@@ -473,13 +479,21 @@ def _compute_lidar_dem_wall_pts(
     if not valid.any():
         return np.empty((0, 2)), dem, (x0, z0)
 
+    # Restrict to center region; outermost strip is scanner boundary artefacts
+    center_mask = np.zeros((H, W), dtype=bool)
+    r0 = int(H * (1 - center_frac) / 2)
+    r1 = H - r0
+    c0 = int(W * (1 - center_frac) / 2)
+    c1 = W - c0
+    center_mask[r0:r1, c0:c1] = True
+
     dmin, dmax = float(np.nanmin(dem)), float(np.nanmax(dem))
     dem_norm = (dem - dmin) / max(dmax - dmin, 1e-6)
     thresh_norm = pct / 100.0
     if use_floor:
-        wr, wc = np.where(valid & (dem_norm <= thresh_norm))
+        wr, wc = np.where(valid & center_mask & (dem_norm <= thresh_norm))
     else:
-        wr, wc = np.where(valid & (dem_norm >= thresh_norm))
+        wr, wc = np.where(valid & center_mask & (dem_norm >= thresh_norm))
     wall_pts = np.stack([x0 + wc * cell_size, z0 + wr * cell_size], axis=1)
     return wall_pts, dem, (x0, z0)
 
@@ -489,6 +503,7 @@ def _load_geotiff_dem_wall_pts(
     ply_world_bbox: tuple,
     wall_pct: float = 30,
     use_floor: bool = True,
+    center_frac: float = 1.0,
 ) -> tuple:
     """
     Load a GeoTIFF DEM (UTM), extract floor (or wall-top) cells, and return
@@ -497,6 +512,11 @@ def _load_geotiff_dem_wall_pts(
     wall_pct is a fixed fraction of the normalized elevation range. With
     use_floor=True (default), selects cells in the BOTTOM wall_pct% — the
     excavated trench floor. With use_floor=False, selects the TOP (100-wall_pct)%.
+
+    center_frac restricts selection to the central portion of the DEM
+    (1.0 = use all cells, default). The excavated pit is not necessarily
+    centred in the GeoTIFF — for this site the floor cells are on the right
+    edge (col centroid at ~89% of width), so a centre crop removes useful data.
 
     The DEM is in absolute UTM; the PLY cloud uses a local origin. Both cover
     the same physical area, so the offset is:
@@ -542,6 +562,15 @@ def _load_geotiff_dem_wall_pts(
           f"Y=[{dem_utm_y_bot:.2f},{dem_utm_y_top:.2f}]")
     print(f"    UTM→local offset: dx={offset_x:.3f}  dy={offset_y:.3f}")
 
+    # Restrict to center region — trench floor is near center; baulks and
+    # surrounding terrain dominate the GeoTIFF edges.
+    center_mask = np.zeros((H_d, W_d), dtype=bool)
+    r0 = int(H_d * (1 - center_frac) / 2)
+    r1 = H_d - r0
+    c0 = int(W_d * (1 - center_frac) / 2)
+    c1 = W_d - c0
+    center_mask[r0:r1, c0:c1] = True
+
     # Normalize to [0,1] and apply fixed fraction threshold so this DEM and
     # the LiDAR DEM both select the same RELATIVE elevation band.
     valid  = ~np.isnan(dem)
@@ -550,9 +579,9 @@ def _load_geotiff_dem_wall_pts(
     dem_norm[valid] = (dem[valid] - dmin) / max(dmax - dmin, 1e-6)
     thresh_norm = wall_pct / 100.0
     if use_floor:
-        wr, wc = np.where(valid & (dem_norm <= thresh_norm))
+        wr, wc = np.where(valid & center_mask & (dem_norm <= thresh_norm))
     else:
-        wr, wc = np.where(valid & (dem_norm >= thresh_norm))
+        wr, wc = np.where(valid & center_mask & (dem_norm >= thresh_norm))
 
     # Pixel (row, col) → UTM → PLY local
     utm_x   = dem_utm_x0   + wc * gt[1]   # left edge of cell
@@ -587,6 +616,8 @@ def register_lidar_to_ply_world_dem(
     lidar_cell_size: float = 0.02,
     wall_pct: float = 30,
     use_floor: bool = True,
+    lidar_center_frac: float = 1.0,
+    ply_center_frac: float = 1.0,
 ) -> tuple:
     """
     DEM-based PCA similarity transform: LiDAR XZ → PLY world XY.
@@ -596,17 +627,26 @@ def register_lidar_to_ply_world_dem(
     selects the bottom wall_pct% — the excavated trench floor — which is the
     same physical surface in both datasets. Scale is forced to 1.0.
 
+    lidar_center_frac and ply_center_frac (both default 1.0 = use all cells)
+    allow restricting floor-cell selection to the central portion of each DEM.
+    For this site the floor cells are near the EDGES of both datasets (LiDAR
+    floor is at the scan boundary corner; GeoTIFF floor is at col~89%), so
+    centre-cropping is disabled by default — use 1.0 unless you know the floor
+    is geometrically central in your specific scan.
+
     Args:
-        lidar_pts:       (V, 3) float32 from process_usdz, Y-up
-        lidar_xz_bbox:   (x0, z0, x1, z1) LiDAR local coords
-        dem_path:        path to GeoTIFF DEM for the top PLY job (UTM Zone 32N)
-        ply_world_bbox:  (x0, y0, x1, y1) PLY local XY extent (from render_topdown_image)
-        lidar_render:    BGR top-down render of LiDAR (for debug)
-        ply_render:      BGR top-down render of PLY (for debug)
-        xz_polygon:      (M, 2) yellow annotation polygon in LiDAR XZ space
-        lidar_cell_size: LiDAR DEM grid resolution in metres (default 2 cm)
-        wall_pct:        fixed fraction of normalized range (default 30 = bottom 30%)
-        use_floor:       True = select low-elevation floor cells; False = high wall-top cells
+        lidar_pts:         (V, 3) float32 from process_usdz, Y-up
+        lidar_xz_bbox:     (x0, z0, x1, z1) LiDAR local coords
+        dem_path:          path to GeoTIFF DEM for the top PLY job (UTM Zone 32N)
+        ply_world_bbox:    (x0, y0, x1, y1) PLY local XY extent (from render_topdown_image)
+        lidar_render:      BGR top-down render of LiDAR (for debug)
+        ply_render:        BGR top-down render of PLY (for debug)
+        xz_polygon:        (M, 2) yellow annotation polygon in LiDAR XZ space
+        lidar_cell_size:   LiDAR DEM grid resolution in metres (default 2 cm)
+        wall_pct:          fixed fraction of normalized range (default 30 = bottom 30%)
+        use_floor:         True = select low-elevation floor cells; False = high wall-top cells
+        lidar_center_frac: fraction of LiDAR DEM to use (centred), default 1.0 (all)
+        ply_center_frac:   fraction of GeoTIFF DEM to use (centred), default 1.0 (all)
 
     Returns:
         transform_fn: callable (N,2) LiDAR XZ → (N,2) PLY world XY
@@ -618,12 +658,14 @@ def register_lidar_to_ply_world_dem(
     # LiDAR DEM from raw vertices (Y-up, XZ horizontal, local metres)
     # ------------------------------------------------------------------
     lidar_wall, lidar_dem, lidar_orig = _compute_lidar_dem_wall_pts(
-        lidar_pts, cell_size=lidar_cell_size, pct=wall_pct, use_floor=use_floor)
+        lidar_pts, cell_size=lidar_cell_size, pct=wall_pct,
+        use_floor=use_floor, center_frac=lidar_center_frac)
     lH, lW = lidar_dem.shape
     label = "floor" if use_floor else "wall-top"
     direction = "<=" if use_floor else ">="
     print(f"  LiDAR DEM: {lW}×{lH} cells at {lidar_cell_size*100:.0f} cm, "
-          f"{len(lidar_wall)} {label} cells (norm{direction}{wall_pct/100:.2f})")
+          f"{len(lidar_wall)} {label} cells (norm{direction}{wall_pct/100:.2f}, "
+          f"center {lidar_center_frac:.0%})")
 
     if len(lidar_wall) < 10:
         raise RuntimeError(f"DEM registration: too few LiDAR {label} cells")
@@ -632,7 +674,8 @@ def register_lidar_to_ply_world_dem(
     # PLY DEM from GeoTIFF, converted to PLY local XY coords
     # ------------------------------------------------------------------
     ply_wall, ply_dem_img = _load_geotiff_dem_wall_pts(
-        dem_path, ply_world_bbox, wall_pct=wall_pct, use_floor=use_floor)
+        dem_path, ply_world_bbox, wall_pct=wall_pct,
+        use_floor=use_floor, center_frac=ply_center_frac)
 
     if len(ply_wall) < 10:
         raise RuntimeError(f"DEM registration: too few PLY {label} cells from GeoTIFF")
