@@ -5,6 +5,7 @@ import gc
 import os
 import sys
 import math
+import numpy as np
 
 from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project
 import glob
@@ -135,6 +136,50 @@ def find_top_bottom_cloud_pairs(point_cloud_dir):
     return pairs
 
 
+def trim_mesh_by_density(mesh, density_min_pct=10):
+    """Remove low-density Poisson faces (phantom boundary bubbles).
+
+    Poisson reconstruction with density=True assigns a per-vertex density
+    scalar. Phantom faces at the crop boundary have few real points nearby
+    and thus low density.  Filtering by density removes these artifacts.
+    Falls back to the original mesh if the API call fails.
+    """
+    try:
+        vert_cloud = mesh.getAssociatedCloud()
+        n_sf = vert_cloud.getNumberOfScalarFields()
+        if n_sf == 0:
+            print("  Density trim: no SFs on vertex cloud, skipping")
+            return mesh
+
+        density_sf_idx = 0
+        vert_cloud.setCurrentScalarField(density_sf_idx)
+        sf = vert_cloud.getScalarField(density_sf_idx)
+        print(f"  Density trim: SF='{sf.getName()}' "
+              f"range [{sf.getMin():.2f}, {sf.getMax():.2f}]")
+
+        vals = sf.toNpArray()
+        finite = vals[np.isfinite(vals)]
+        if len(finite) == 0:
+            return mesh
+        threshold = float(np.percentile(finite, density_min_pct))
+        sf_max = float(sf.getMax())
+        print(f"  Density trim: threshold={threshold:.3f} "
+              f"(p{density_min_pct} of {len(finite)} vertices)")
+
+        trimmed = cc.filterBySFValue(threshold, sf_max * 1.01, mesh)
+
+        if trimmed is not None and trimmed.size() > 0:
+            print(f"  Density trim: {mesh.size()} → {trimmed.size()} faces")
+            trimmed.setName(mesh.getName() + "_trimmed")
+            return trimmed
+        else:
+            print("  Density trim: filterBySFValue returned empty/None, using original")
+            return mesh
+    except Exception as e:
+        print(f"  Density trim failed ({e}) — using original mesh")
+        return mesh
+
+
 def filter_by_c2c_distance(cloud, low_percentile=10):
     """
     Remove points whose C2C distance scalar field value falls below
@@ -228,9 +273,8 @@ def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path):
     # Merge the two clouds
     print("Merging clouds...")
     try:
-        merged_cloud = cc.MergeEntities(
-            [top_cloud, bottom_cloud], deleteOriginalClouds=False
-        )
+        merged_cloud = cc.MergeEntities([top_cloud, bottom_cloud],
+                                        deleteOriginalClouds=False)
         if merged_cloud is None:
             raise ValueError("Failed to merge clouds")
         print(f"Merged cloud created with {merged_cloud.size()} points")
@@ -253,7 +297,8 @@ def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path):
         )
         merged_mesh.setName(f"{su_number}_merged")
         if merged_mesh is not None:
-            print("Mesh created with Poisson Reconstructions.")
+            print("Mesh created with Poisson Reconstruction.")
+            merged_mesh = trim_mesh_by_density(merged_mesh, density_min_pct=10)
         else:
             print("Error: Failed to create mesh")
 

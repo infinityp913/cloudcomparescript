@@ -548,4 +548,8 @@ if __name__ == "__main__":
             print(f"  Saved: {os.path.basename(top_path)}")
             print(f"  Saved: {os.path.basename(bot_path)}")
 
+            poly_path = os.path.join(output_dir, f"su_{su_number}_polygon.npy")
+            np.save(poly_path, yellow_world)
+            print(f"  Saved polygon: su_{su_number}_polygon.npy")
+
     print("\nAuto-snip complete.")
