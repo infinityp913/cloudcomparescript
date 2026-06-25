@@ -1117,7 +1117,7 @@ def _densify_polygon(pts: np.ndarray, step: float = 3.0) -> np.ndarray:
 
 
 # Method 5 ─────────────────────────────────────────────────────────────────
-def register_lidar_to_ply_world_chamfer(
+def register_lidar_to_ply_world_pca_chamfer(
     lidar_render: np.ndarray,
     lidar_xz_bbox: tuple,
     ply_render: np.ndarray,
@@ -1131,8 +1131,8 @@ def register_lidar_to_ply_world_chamfer(
     dense edges, while free-rotation search in clutter will snap to any coincident
     edge pattern regardless of semantic correctness.
     """
-    cx_li, ang_li, _, _ = _pca_footprint(lidar_render)
-    cx_pl, ang_pl, _, _ = _pca_footprint(ply_render)
+    cx_li, ang_li, std_main_li, std_perp_li = _pca_footprint(lidar_render)
+    cx_pl, ang_pl, std_main_pl, std_perp_pl = _pca_footprint(ply_render)
     lH, lW = lidar_render.shape[:2]
     pH, pW = ply_render.shape[:2]
     lx0, lz0, lx1, lz1 = lidar_xz_bbox
@@ -1213,7 +1213,23 @@ def register_lidar_to_ply_world_chamfer(
     cv2.polylines(debug_img, [ply_px_r.reshape(-1,1,2)], True, (0,255,0), 4)
     lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
                                 f"PLY ({note})")
-    return transform_fn, debug_img, note, {"lidar_vs_result": lvr}
+
+    # PCA axes side-by-side: LiDAR panel (cyan annotation) | PLY panel (green result)
+    li_panel = _draw_pca_axes_on_render(
+        lidar_render, cx_li, ang_li, std_main_li, std_perp_li, "LiDAR")
+    cv2.polylines(li_panel, [yellow_lidar_px.astype(np.int32).reshape(-1, 1, 2)],
+                  isClosed=True, color=(0, 255, 255), thickness=3)
+    pl_panel = _draw_pca_axes_on_render(
+        ply_render, cx_pl, ang_pl, std_main_pl, std_perp_pl, "PLY")
+    cv2.polylines(pl_panel, [ply_px_r.reshape(-1, 1, 2)],
+                  isClosed=True, color=(0, 255, 0), thickness=3)
+    if li_panel.shape[0] != pl_panel.shape[0]:
+        tH = pl_panel.shape[0]
+        tW = int(li_panel.shape[1] * tH / li_panel.shape[0])
+        li_panel = cv2.resize(li_panel, (tW, tH))
+    pca_axes_img = np.hstack([li_panel, pl_panel])
+
+    return transform_fn, debug_img, note, {"lidar_vs_result": lvr, "pca_axes": pca_axes_img}
 
 
 # Method 6 ─────────────────────────────────────────────────────────────────

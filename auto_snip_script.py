@@ -399,7 +399,7 @@ if __name__ == "__main__":
 
                 try:
                     transform, debug_reg, reg_note, reg_debug = \
-                        auto_snip_lidar.register_lidar_to_ply_world_chamfer(
+                        auto_snip_lidar.register_lidar_to_ply_world_pca_chamfer(
                             lidar["lidar_render"], lidar["lidar_xz_bbox"],
                             render_img, render_world_bbox,
                             lidar["xz_polygon"],
@@ -432,7 +432,7 @@ if __name__ == "__main__":
                     ("prerot_akaze",  auto_snip_lidar.register_lidar_to_ply_world_prerot_akaze),
                     ("annot_bndry",   auto_snip_lidar.register_lidar_to_ply_world_annot_boundary),
                     ("dist_pca",      auto_snip_lidar.register_lidar_to_ply_world_dist_pca),
-                    ("chamfer",       auto_snip_lidar.register_lidar_to_ply_world_chamfer),
+                    ("pca_chamfer",   auto_snip_lidar.register_lidar_to_ply_world_pca_chamfer),
                     ("mutual_info",   auto_snip_lidar.register_lidar_to_ply_world_mutual_info),
                 ]
                 for _mname, _mfn in _exp_methods:
