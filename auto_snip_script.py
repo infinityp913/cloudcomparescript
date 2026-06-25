@@ -397,30 +397,46 @@ if __name__ == "__main__":
                 # ------------------------------------------------------------------
                 dem_path = os.path.join(DATA_DIR, "DEMs", f"{top_id}_dem.tif")
 
+                # Registration strategy:
+                # 1. PreRotAKAZE — reliable when the scene has texture correspondence
+                #    (≥20 RANSAC inliers).  Fails gracefully when the modality gap is
+                #    too large (LiDAR interior walls vs PLY top-down view).
+                # 2. PCA-Chamfer — fallback when AKAZE can't find enough matches.
+                #    Locks PCA rotation and chamfer-searches translation only.
+                # 3. RGB PCA — last resort.
+                AKAZE_MIN_INLIERS = 20
+                _reg_args = (lidar["lidar_render"], lidar["lidar_xz_bbox"],
+                             render_img, render_world_bbox, lidar["xz_polygon"])
+                transform = debug_reg = reg_note = reg_debug = None
                 try:
                     transform, debug_reg, reg_note, reg_debug = \
-                        auto_snip_lidar.register_lidar_to_ply_world_pca_chamfer(
-                            lidar["lidar_render"], lidar["lidar_xz_bbox"],
-                            render_img, render_world_bbox,
-                            lidar["xz_polygon"],
-                        )
+                        auto_snip_lidar.register_lidar_to_ply_world_prerot_akaze(*_reg_args)
+                    if reg_debug.get("inliers", 0) < AKAZE_MIN_INLIERS:
+                        print(f"  AKAZE only {reg_debug['inliers']} inliers "
+                              f"(< {AKAZE_MIN_INLIERS}) — falling back to PCA-Chamfer")
+                        transform = None
                 except RuntimeError as e:
-                    print(f"  Chamfer failed: {e} — falling back to RGB PCA")
+                    print(f"  AKAZE failed: {e} — falling back to PCA-Chamfer")
+
+                if transform is None:
                     try:
                         transform, debug_reg, reg_note, reg_debug = \
-                            auto_snip_lidar.register_lidar_to_ply_world(
-                                lidar["lidar_render"], lidar["lidar_xz_bbox"],
-                                render_img, render_world_bbox,
-                                lidar["xz_polygon"],
-                            )
-                    except RuntimeError as e2:
-                        print(f"  Registration failed: {e2}")
-                        continue
+                            auto_snip_lidar.register_lidar_to_ply_world_pca_chamfer(*_reg_args)
+                    except RuntimeError as e:
+                        print(f"  PCA-Chamfer failed: {e} — falling back to RGB PCA")
+                        try:
+                            transform, debug_reg, reg_note, reg_debug = \
+                                auto_snip_lidar.register_lidar_to_ply_world(*_reg_args)
+                        except RuntimeError as e2:
+                            print(f"  Registration failed: {e2}")
+                            continue
 
                 reg_path = os.path.join(output_dir, f"debug_SU{su_number}_registration.png")
                 cv2.imwrite(reg_path, debug_reg)
                 print(f"  Registration ({reg_note}): {reg_path}")
                 for key, img_arr in reg_debug.items():
+                    if not isinstance(img_arr, np.ndarray):
+                        continue
                     cv2.imwrite(
                         os.path.join(output_dir, f"debug_SU{su_number}_{key}.png"), img_arr)
                     print(f"  Saved: debug_SU{su_number}_{key}.png")

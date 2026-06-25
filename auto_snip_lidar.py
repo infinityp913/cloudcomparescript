@@ -855,7 +855,8 @@ def register_lidar_to_ply_world_prerot_akaze(
     lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
                                 f"PLY ({best_note})")
     print(f"  [PreRotAKAZE] {best_note}")
-    return transform_fn, debug_img, best_note, {"lidar_vs_result": lvr}
+    return transform_fn, debug_img, best_note, {"lidar_vs_result": lvr,
+                                                "inliers": best_inliers}
 
 
 # Method 3 ─────────────────────────────────────────────────────────────────
