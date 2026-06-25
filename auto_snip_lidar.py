@@ -320,6 +320,48 @@ def _pca_footprint(render_bgr: np.ndarray) -> tuple:
     return center, angle, float(np.sqrt(eigenvalues[-1])), float(np.sqrt(eigenvalues[0]))
 
 
+def _draw_pca_axes_on_render(
+    img: np.ndarray,
+    center,
+    angle_deg: float,
+    std_main: float,
+    std_perp: float,
+    label: str = "",
+) -> np.ndarray:
+    """Return a copy of img with PCA centre (red dot), main axis (yellow), minor axis (magenta)."""
+    out = img.copy()
+    cx, cy = float(center[0]), float(center[1])
+    icx, icy = int(round(cx)), int(round(cy))
+    r = np.radians(angle_deg)
+    dx,  dy  =  np.cos(r),  np.sin(r)     # main axis direction
+    dpx, dpy = -np.sin(r),  np.cos(r)     # minor axis (perpendicular)
+
+    Lmain = int(std_main * 3)
+    Lperp = int(std_perp * 3)
+
+    # main axis — yellow
+    cv2.line(out, (icx - int(dx * Lmain), icy - int(dy * Lmain)),
+                  (icx + int(dx * Lmain), icy + int(dy * Lmain)), (0, 255, 255), 4)
+    # minor axis — magenta
+    cv2.line(out, (icx - int(dpx * Lperp), icy - int(dpy * Lperp)),
+                  (icx + int(dpx * Lperp), icy + int(dpy * Lperp)), (255, 0, 255), 3)
+    # centre dot — red with white ring
+    cv2.circle(out, (icx, icy), 12, (0, 0, 255), -1)
+    cv2.circle(out, (icx, icy), 14, (255, 255, 255), 2)
+
+    # angle label
+    cv2.putText(out, f"{angle_deg:.1f} deg", (icx + 18, icy - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5)
+    cv2.putText(out, f"{angle_deg:.1f} deg", (icx + 18, icy - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+
+    if label:
+        cv2.putText(out, label, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 6)
+        cv2.putText(out, label, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 3)
+
+    return out
+
+
 def register_lidar_to_ply_world(
     lidar_render: np.ndarray,
     lidar_xz_bbox: tuple,
@@ -341,6 +383,12 @@ def register_lidar_to_ply_world(
         transform_fn: callable (N,2) LiDAR XZ → (N,2) PLY world XY
         debug_img:    BGR image: PLY render with transformed yellow hull in green
         note:         str describing which orientation was chosen
+        pca_debug:    dict of extra debug images:
+                        'pca_axes'         — side-by-side panels: LiDAR | PLY, each with PCA
+                                             centre dot (red), main axis (yellow), minor (magenta)
+                                             and the yellow annotation polygon (cyan on LiDAR)
+                        'rotation_overlay' — PLY render (base) with warped LiDAR blended at 50%
+                                             opacity, showing rotation quality and any centre shift
     """
     cx_li, ang_li, std_main_li, std_perp_li = _pca_footprint(lidar_render)
     cx_pl, ang_pl, std_main_pl, std_perp_pl = _pca_footprint(ply_render)
@@ -409,13 +457,43 @@ def register_lidar_to_ply_world(
         world[:, 1] = py1 - ply_px[:, 1] * (py1 - py0) / pH
         return world
 
-    # Debug: PLY render with transformed yellow hull in green
+    # --- debug_img: PLY render with transformed yellow hull in green ---
     ply_px = _apply_M(chosen_M, yellow_lidar_px).astype(np.int32)
     debug_img = ply_render.copy()
     cv2.polylines(debug_img, [ply_px.reshape(-1, 1, 2)],
                   isClosed=True, color=(0, 255, 0), thickness=4)
 
-    return transform_fn, debug_img, note
+    # --- pca_debug['pca_axes']: side-by-side panels with PCA axes ---
+    li_panel = _draw_pca_axes_on_render(lidar_render, cx_li, ang_li, std_main_li, std_perp_li, "LiDAR")
+    cv2.polylines(li_panel, [yellow_lidar_px.astype(np.int32).reshape(-1, 1, 2)],
+                  isClosed=True, color=(0, 255, 255), thickness=3)
+
+    pl_panel = _draw_pca_axes_on_render(ply_render, cx_pl, ang_pl, std_main_pl, std_perp_pl, "PLY")
+
+    # resize LiDAR panel to PLY panel height for hstack
+    if li_panel.shape[0] != pl_panel.shape[0]:
+        tH = pl_panel.shape[0]
+        tW = int(li_panel.shape[1] * tH / li_panel.shape[0])
+        li_panel = cv2.resize(li_panel, (tW, tH))
+    pca_axes_img = np.hstack([li_panel, pl_panel])
+
+    # --- pca_debug['rotation_overlay']: warp LiDAR onto PLY space, blend ---
+    M_2x3 = chosen_M[:2, :]
+    warped_lidar = cv2.warpAffine(lidar_render, M_2x3, (pW, pH))
+    mask = warped_lidar.sum(axis=2) > 0
+    base_f  = ply_render.astype(np.float32)
+    warp_f  = warped_lidar.astype(np.float32)
+    blended = np.where(mask[:, :, np.newaxis], (0.5 * base_f + 0.5 * warp_f), base_f).astype(np.uint8)
+    cv2.polylines(blended, [ply_px.reshape(-1, 1, 2)],
+                  isClosed=True, color=(0, 255, 0), thickness=4)
+    for txt, y in [(f"PLY (base) + LiDAR warped (50%)", 50),
+                   (f"{note}  scale={scale:.4f}", 90)]:
+        cv2.putText(blended, txt, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5)
+        cv2.putText(blended, txt, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+
+    pca_debug = {"pca_axes": pca_axes_img, "rotation_overlay": blended}
+
+    return transform_fn, debug_img, note, pca_debug
 
 
 # ---------------------------------------------------------------------------
@@ -1051,7 +1129,7 @@ def register_lidar_to_ply_world_icp(
     import cloudComPy as cc
 
     # ---- Step 1: initial RGB PCA alignment ----
-    transform_pca, debug_pca, note_pca = register_lidar_to_ply_world(
+    transform_pca, debug_pca, note_pca, _ = register_lidar_to_ply_world(
         lidar_render, lidar_xz_bbox, ply_render, ply_world_bbox, xz_polygon)
     print(f"  ICP initial alignment: {note_pca}")
 
@@ -1165,7 +1243,7 @@ def register_lidar_to_ply_world_icp_3d(
     import cloudComPy as cc
 
     # ---- Step 1: initial RGB PCA ----
-    transform_pca, debug_pca, note_pca = register_lidar_to_ply_world(
+    transform_pca, debug_pca, note_pca, _ = register_lidar_to_ply_world(
         lidar_render, lidar_xz_bbox, ply_render, ply_world_bbox, xz_polygon)
     print(f"  3-D ICP initial alignment: {note_pca}")
 

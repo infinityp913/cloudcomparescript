@@ -412,12 +412,13 @@ if __name__ == "__main__":
 
                 if not use_dem:
                     try:
-                        transform, debug_reg, reg_note = auto_snip_lidar.register_lidar_to_ply_world(
-                            lidar["lidar_render"], lidar["lidar_xz_bbox"],
-                            render_img, render_world_bbox,
-                            lidar["xz_polygon"],
-                        )
-                        dem_debug = {}
+                        transform, debug_reg, reg_note, pca_debug = \
+                            auto_snip_lidar.register_lidar_to_ply_world(
+                                lidar["lidar_render"], lidar["lidar_xz_bbox"],
+                                render_img, render_world_bbox,
+                                lidar["xz_polygon"],
+                            )
+                        dem_debug = pca_debug
                     except RuntimeError as e2:
                         print(f"  Registration failed: {e2}")
                         continue
