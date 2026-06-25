@@ -78,7 +78,7 @@ Same as above but:
 
 ---
 
-### 5. Floor approach — bottom 30% of normalized range, scale = 1.0 (**current best**)
+### 5. Floor approach — bottom 30% of normalized range, scale = 1.0
 `_compute_lidar_dem_wall_pts(..., use_floor=True, pct=30)`
 `_load_geotiff_dem_wall_pts(..., use_floor=True, wall_pct=30)`
 
@@ -90,10 +90,8 @@ Selected the **lowest 30% of normalized elevation** in both DEMs instead of the 
 - LiDAR: 1,846 floor cells, centre XZ=(0.613, -6.562), angle=173.2°
 - GeoTIFF: 178,503 floor cells (≤ 2.380 m abs), centre=(225.011, 817.276), angle=81.6°
 - Registration: rotation=88.3°, scale=1.0
-- Yellow polygon world extent: X=[213.343, 224.534] Y=[812.717, 820.323]
-- Result: polygon within PLY render bounds, correct "E" shape with wall notches
 
-**Known fragility:** LiDAR floor cells are sparse (1,846) and concentrated in one corner of the scan. The 88.3° rotation is approximately 90° — the LiDAR Z-axis maps to the PLY X-axis, which is geographically plausible but could fail if a future scanner is oriented differently.
+**Known fragility:** LiDAR floor cells are sparse (1,846) and concentrated in one corner of the scan, not the interior. Floor centroid is at the scan boundary (render row 99 of 1512), making it an unstable translation anchor. The PCA rotation is approximately 90° which is plausible geographically but could fail if a future scanner is oriented differently.
 
 ---
 
@@ -119,22 +117,90 @@ Registration result: polygon mostly outside render bounds (upper-right), clearly
 
 ---
 
+### 8. Hybrid: PCA rotation + DEM floor centroid translation (failed)
+`register_lidar_to_ply_world_dem_center()`
+
+Used PCA to get rotation, then used DEM floor centroids (bottom 30% elevation) as the translation anchor instead of the PCA centroid.
+
+**Why it failed:** LiDAR floor centroid is at render pixel (602, 99) — row 99 of 1512, right at the top scan boundary. The iPhone scanner is placed *inside* the trench so the floor appears at the scan edge, not the centre. This makes the floor centroid an unstable anchor that pushes the annotation off-screen (top-right).
+
+---
+
+### 9. Four appearance-based experimental methods (all failed — wrong tool)
+**Branch:** `automate-snipping-fix-shift`
+
+Tried in the comparison block: phase-correlation on Canny edges, pre-rotated AKAZE feature matching, annotation-boundary phase correlation, distance-weighted PCA centroid.
+
+**Root cause of all failures:** The LiDAR scanned from *inside* the trench and sees wall **faces**; the photogrammetry sees wall **tops** from above. The two renders genuinely do not look alike:
+- AKAZE got 4 RANSAC inliers (effectively nothing)
+- Phase-correlation response ≈ 0.005 (noise floor)
+- Appearance-based matching is the fundamentally wrong tool for this modality pair
+
+**Distance-weighted PCA** (pixels weighted by squared distance from scan boundary) was the best of this batch — it got closer to the right position than standard PCA by downweighting peripheral scan extent that differs between modalities.
+
+---
+
+### 10. Chamfer E-shape matching + PCA-locked rotation (**current best, in production**)
+`register_lidar_to_ply_world_chamfer()`
+
+**Key insight:** Rotation is correct from PCA (-241.2° for SU22000_SU1); only translation is wrong. And the annotation E-polygon *is* the wall outline — its boundary should land on PLY wall edges.
+
+Algorithm:
+1. PCA on both renders → rotation `ang_pl - ang_li`. Correct 180° flip via polygon-within-bounds check.
+2. **Lock rotation** to the PCA value (no rotation search).
+3. Build PLY Canny edge image → distance transform `dt`.
+4. Densify E-polygon into ~3px-spaced points; cost = mean `dt` at transformed points.
+5. Coarse-to-fine 2-DOF translation search: ±300px coarse (20px steps), ±20px fine (4px steps).
+
+**Result for SU22000_SU1:** meanDist=7.09px, annotation sits squarely in the excavation with the E-shape tracing wall edges. Top crop: 1.57M pts (vs 1.1M with baseline). Visually correct.
+
+**Why it works:** Reducing from 3-DOF (rotation + translation) to 2-DOF (translation only) eliminates the clutter problem — even with dense PLY wall edges everywhere, a 2D slide of the E-shape finds the unique pose where ALL polygon edges align simultaneously.
+
+---
+
+### 11. DEM gradient-ridge matching (ran but less accurate than chamfer)
+`register_lidar_to_ply_world_dem_ridge()`
+
+Builds slope-magnitude images from LiDAR height grid and GeoTIFF DEM. Walls appear as high-gradient ridges in both. Chamfer-searches LiDAR ridge points against PLY ridge distance transform.
+
+**Problem:** GeoTIFF produces 381,003 ridge cells (top 10% of all slopes) — far too many to give a selective signal. LiDAR only has 239 ridge cells. The imbalance makes the distance transform too dense and the cost surface flat. Result at translation-only search: meanDist=7.67px vs chamfer's 7.09px, with slight annotation clip at the render top.
+
+**Potential improvement:** Threshold the GeoTIFF ridges more aggressively (top 2-3%) or restrict to the area of the site where the trench is.
+
+---
+
+### 12. Mutual information (failed — modality coupling too weak)
+`register_lidar_to_ply_world_mutual_info()`
+
+Maximised MI between downsampled PLY and warped LiDAR gray images. MI=0.101 — extremely low, confirming that faces-vs-tops have essentially no pixel-level statistical coupling. Result was worse than baseline (annotation pushed off top-right edge). Dead end for this modality pair.
+
+---
+
 ## Key invariants
 
 - `scale = 1.0` always. Both LiDAR and PLY are physical metres, same scene.
+- Rotation from RGB PCA is correct for this site (-241.2°). Lock it; don't re-search it.
 - Threshold is a **fixed fraction of the elevation range** (`pct/100.0`), NOT a data percentile.
 - `center_frac` parameters exist in the API but default to 1.0 (disabled). Only enable if you know the floor is geometrically central in both scans for your site.
 - PCA 180° ambiguity: always check both 0° and 180° rotations and pick the one where the yellow polygon falls inside the PLY render bounds.
+
+## Potential future work
+
+- **Chamfer with fine rotation refinement:** Now that translation is right, a tight ±5° rotation refinement around the PCA value might squeeze out the last few pixels of error.
+- **DEM ridge with tighter GeoTIFF threshold:** Top 2% of ridge cells (not 10%) would give a sparser, more distinctive PLY ridge pattern that might help.
+- **Multi-scan validation:** Test on a different USDZ (different scanner orientation). If PCA rotation fails on a new scan, chamfer's free-rotation search can be re-enabled with a tighter angular range (±30° around PCA) rather than ±20°.
+- **Bubble removal in Poisson output:** Higher C2C percentile filter makes bubbles worse (removes too many boundary-constraining points). Better approach may be density-scalar trimming after Poisson, or filtering by normal Z component to remove near-vertical phantom faces.
 
 ## Debug images written per annotation
 
 | File | Contents |
 |------|----------|
 | `debug_<SU>_lidar_yellow.png` | LiDAR render with yellow annotation highlighted and green contour polygon |
-| `debug_<SU>_lidar_dem_img.png` | LiDAR DEM (grayscale, max-Y per XZ cell) with selected floor cells in red |
-| `debug_<SU>_ply_dem_img.png` | GeoTIFF DEM (grayscale, centre-normalised) with selected floor cells in red |
+| `debug_<SU>_lidar_vs_result.png` | Side-by-side: LiDAR annotation (cyan) \| PLY with result polygon (green) |
+| `debug_<SU>_pca_axes.png` | PCA axis overlays on both renders for rotation debugging |
 | `debug_<SU>_registration.png` | PLY top-down render with transformed annotation polygon in magenta |
 | `debug_<SU>_snip_reference.png` | PLY render (left) + darkened render with crop region in green (right) |
+| `debug_<SU>_{method}_lidar_vs_result.png` | Same comparison for each experimental method |
 
 ## Branch history
 
@@ -142,4 +208,5 @@ Registration result: polygon mostly outside render bounds (upper-right), clearly
 |--------|---------|
 | `main` | Original working scripts |
 | `lidar-annotation-strategy` | USDZ parsing, yellow face extraction, contour polygon |
-| `lidar-dem-registration` | All DEM-based PCA registration experiments (current) |
+| `lidar-dem-registration` | DEM-based PCA registration experiments |
+| `automate-snipping-fix-shift` | All translation-fix experiments; chamfer matching (current production) |
