@@ -116,6 +116,8 @@ def _yellow_xz_polygon(
 
     grid = np.zeros((H, W), dtype=np.uint8)
     grid[row, col] = 255
+    # Round stairstep corners from grid quantization before contouring
+    grid = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(grid, connectivity=8)
     if n_labels < 2:
@@ -218,13 +220,15 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
             print(f"  Texture: {tex_w}×{tex_h}")
 
             # ----------------------------------------------------------------
-            # Per-face UV centroid → sample texture color
+            # Per-vertex UV → texture color, averaged across face vertices.
+            # Sampling at each vertex then averaging gives more accurate color
+            # than sampling at the UV centroid (avoids seam/mip bias).
             # UV: U→x, V→y with V flipped (USD V=0 = bottom, OpenCV row=0 = top)
             # ----------------------------------------------------------------
-            uv = sts[fvi].mean(axis=1)                             # (F, 2)
-            tex_px = np.clip((uv[:, 0] * tex_w).astype(np.int32), 0, tex_w - 1)
-            tex_py = np.clip(((1.0 - uv[:, 1]) * tex_h).astype(np.int32), 0, tex_h - 1)
-            face_colors = texture[tex_py, tex_px]                  # (F, 3) BGR
+            tex_px_v = np.clip((sts[:, 0] * tex_w).astype(np.int32), 0, tex_w - 1)
+            tex_py_v = np.clip(((1.0 - sts[:, 1]) * tex_h).astype(np.int32), 0, tex_h - 1)
+            vertex_colors = texture[tex_py_v, tex_px_v]            # (V, 3) BGR
+            face_colors = vertex_colors[fvi].mean(axis=1).astype(np.uint8)  # (F, 3) BGR
 
             yellow_mask = _yellow_mask_bgr(face_colors)
             print(f"  Yellow faces: {yellow_mask.sum()} / {n_faces}")
@@ -243,7 +247,7 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
             # Build tight contour polygon from yellow centroids.
             # Rasterises to a 10 cm grid, keeps the largest connected cluster,
             # extracts the outer boundary contour, and simplifies to 20 cm tolerance.
-            xz_polygon, xz_pts = _yellow_xz_polygon(xz_pts, cell_size=0.10, simplify_m=0.20)
+            xz_polygon, xz_pts = _yellow_xz_polygon(xz_pts, cell_size=0.05, simplify_m=0.15)
             print(f"  Yellow XZ extent: "
                   f"X=[{xz_pts[:,0].min():.2f}, {xz_pts[:,0].max():.2f}]  "
                   f"Z=[{xz_pts[:,1].min():.2f}, {xz_pts[:,1].max():.2f}]")
@@ -281,6 +285,9 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
             for fi in face_order:
                 tri = face_cols[fi].reshape(3, 2)
                 cv2.fillPoly(img, [tri], face_colors[fi].tolist())
+
+            # Fill small inter-triangle gaps without expanding the boundary
+            img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
             return {
                 "xz_polygon":    xz_polygon,
@@ -360,6 +367,33 @@ def _draw_pca_axes_on_render(
         cv2.putText(out, label, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 3)
 
     return out
+
+
+def _make_lidar_vs_result(
+    lidar_render: np.ndarray,
+    yellow_lidar_px: np.ndarray,
+    ply_render: np.ndarray,
+    ply_result_px: np.ndarray,
+    label: str = "PLY result",
+) -> np.ndarray:
+    """Side-by-side: LiDAR render (cyan annotation) | PLY render (green annotation)."""
+    li = lidar_render.copy()
+    cv2.polylines(li, [yellow_lidar_px.astype(np.int32).reshape(-1, 1, 2)],
+                  True, (0, 255, 255), 3)
+    cv2.putText(li, "LiDAR annotation", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 5)
+    cv2.putText(li, "LiDAR annotation", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+
+    pl = ply_render.copy()
+    cv2.polylines(pl, [ply_result_px.astype(np.int32).reshape(-1, 1, 2)],
+                  True, (0, 255, 0), 4)
+    cv2.putText(pl, label, (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 5)
+    cv2.putText(pl, label, (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+
+    if li.shape[0] != pl.shape[0]:
+        tH = pl.shape[0]
+        tW = int(li.shape[1] * tH / li.shape[0])
+        li = cv2.resize(li, (tW, tH))
+    return np.hstack([li, pl])
 
 
 def register_lidar_to_ply_world(
@@ -477,23 +511,974 @@ def register_lidar_to_ply_world(
         li_panel = cv2.resize(li_panel, (tW, tH))
     pca_axes_img = np.hstack([li_panel, pl_panel])
 
-    # --- pca_debug['rotation_overlay']: warp LiDAR onto PLY space, blend ---
-    M_2x3 = chosen_M[:2, :]
-    warped_lidar = cv2.warpAffine(lidar_render, M_2x3, (pW, pH))
-    mask = warped_lidar.sum(axis=2) > 0
-    base_f  = ply_render.astype(np.float32)
-    warp_f  = warped_lidar.astype(np.float32)
-    blended = np.where(mask[:, :, np.newaxis], (0.5 * base_f + 0.5 * warp_f), base_f).astype(np.uint8)
-    cv2.polylines(blended, [ply_px.reshape(-1, 1, 2)],
-                  isClosed=True, color=(0, 255, 0), thickness=4)
-    for txt, y in [(f"PLY (base) + LiDAR warped (50%)", 50),
-                   (f"{note}  scale={scale:.4f}", 90)]:
-        cv2.putText(blended, txt, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5)
-        cv2.putText(blended, txt, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+    lidar_vs_result = _make_lidar_vs_result(
+        lidar_render, yellow_lidar_px, ply_render, ply_px, "PLY (RGB PCA)")
 
-    pca_debug = {"pca_axes": pca_axes_img, "rotation_overlay": blended}
+    pca_debug = {"pca_axes": pca_axes_img, "lidar_vs_result": lidar_vs_result}
 
     return transform_fn, debug_img, note, pca_debug
+
+
+def register_lidar_to_ply_world_dem_center(
+    lidar_pts: np.ndarray,
+    lidar_xz_bbox: tuple,
+    dem_path: str,
+    ply_world_bbox: tuple,
+    lidar_render: np.ndarray,
+    ply_render: np.ndarray,
+    xz_polygon: np.ndarray,
+    pct: float = 30,
+) -> tuple:
+    """
+    Hybrid registration: RGB footprint PCA for rotation + DEM floor centroid for translation.
+
+    The PCA footprint gives a reliable rotation (the scan outline principal axis
+    is stable regardless of scan extent) but an unreliable translation (the
+    centroid of all non-black pixels drifts with how much extra area each scan
+    captured beyond the trench).  The DEM floor centroid — mean XZ/XY position
+    of the lowest-elevation cells in each scan — anchors to the physical trench
+    floor, which is the same point in both datasets.
+
+    Scale is forced to 1.0 (both datasets are physical metres, same scene).
+
+    Returns (transform_fn, debug_img, note, pca_debug).
+    pca_debug keys:
+        'pca_axes'        — side-by-side LiDAR|PLY with PCA axes (red dot) and
+                            DEM floor centroid (blue cross)
+        'lidar_vs_result' — LiDAR annotation | PLY result for visual comparison
+    """
+    cx_li, ang_li, std_main_li, std_perp_li = _pca_footprint(lidar_render)
+    cx_pl, ang_pl, std_main_pl, std_perp_pl = _pca_footprint(ply_render)
+    scale = 1.0
+
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    print(f"  [Hybrid] RGB PCA: LiDAR angle={ang_li:.1f}°  PLY angle={ang_pl:.1f}°  "
+          f"rot={ang_pl - ang_li:.1f}°")
+
+    # --- DEM floor centroids (same calls as register_lidar_to_ply_world_dem) ---
+    lidar_floor_pts, _, _ = _compute_lidar_dem_wall_pts(lidar_pts, use_floor=True, pct=pct)
+    if len(lidar_floor_pts) < 10:
+        raise RuntimeError(
+            f"Hybrid: too few LiDAR floor cells ({len(lidar_floor_pts)}) — "
+            "try raising pct or check DEM quality")
+
+    ply_floor_pts, _ = _load_geotiff_dem_wall_pts(
+        dem_path, ply_world_bbox, use_floor=True, wall_pct=pct)
+    if len(ply_floor_pts) < 10:
+        raise RuntimeError(
+            f"Hybrid: too few PLY floor cells ({len(ply_floor_pts)}) — "
+            "try raising pct or check GeoTIFF coverage")
+
+    lidar_fc_xz = lidar_floor_pts.mean(axis=0)   # (x, z) in LiDAR XZ local space
+    ply_fc_xy   = ply_floor_pts.mean(axis=0)      # (x, y) in PLY world space
+
+    # Convert floor centroids to render pixel space (same mapping used by transform_fn)
+    def _xz_to_lidar_px(xz_pts):
+        col = (xz_pts[:, 0] - lx0) / (lx1 - lx0) * lW
+        row = (xz_pts[:, 1] - lz0) / (lz1 - lz0) * lH
+        return np.stack([col, row], axis=1)
+
+    lidar_fc_px = _xz_to_lidar_px(lidar_fc_xz[np.newaxis])[0]   # (col, row)
+    ply_fc_px   = np.array([
+        (ply_fc_xy[0] - px0) / (px1 - px0) * pW,
+        (py1 - ply_fc_xy[1]) / (py1 - py0) * pH,
+    ])
+
+    print(f"  [Hybrid] LiDAR floor centroid: XZ=({lidar_fc_xz[0]:.3f},{lidar_fc_xz[1]:.3f})  "
+          f"render=({lidar_fc_px[0]:.0f},{lidar_fc_px[1]:.0f})  n={len(lidar_floor_pts)}")
+    print(f"  [Hybrid] PLY   floor centroid: XY=({ply_fc_xy[0]:.3f},{ply_fc_xy[1]:.3f})  "
+          f"render=({ply_fc_px[0]:.0f},{ply_fc_px[1]:.0f})  n={len(ply_floor_pts)}")
+
+    def _make_M(rot_deg: float) -> np.ndarray:
+        r = np.radians(rot_deg)
+        c, s = np.cos(r), np.sin(r)
+        # Translation anchored to DEM floor centroids, not PCA centroids
+        tx = ply_fc_px[0] - scale * (c * lidar_fc_px[0] - s * lidar_fc_px[1])
+        ty = ply_fc_px[1] - scale * (s * lidar_fc_px[0] + c * lidar_fc_px[1])
+        return np.array([[scale * c, -scale * s, tx],
+                         [scale * s,  scale * c, ty],
+                         [0, 0, 1]])
+
+    def _apply_M(M, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M @ h.T).T[:, :2]
+
+    def _within_ply_render(rpts, margin=0.15):
+        return (rpts[:, 0].min() > -pW * margin and
+                rpts[:, 0].max() <  pW * (1 + margin) and
+                rpts[:, 1].min() > -pH * margin and
+                rpts[:, 1].max() <  pH * (1 + margin))
+
+    yellow_lidar_px = _xz_to_lidar_px(xz_polygon)
+    rot_deg = ang_pl - ang_li
+    chosen_M, note = None, ""
+    for rotation in [rot_deg, rot_deg + 180]:
+        M = _make_M(rotation)
+        if _within_ply_render(_apply_M(M, yellow_lidar_px)):
+            note = f"Hybrid DEM-centre rotation={rotation:.1f}°"
+            chosen_M = M
+            break
+    if chosen_M is None:
+        chosen_M = _make_M(rot_deg)
+        note = f"Hybrid DEM-centre rotation={rot_deg:.1f}° (fallback)"
+    print(f"  {note}")
+
+    def transform_fn(xz_pts: np.ndarray) -> np.ndarray:
+        lidar_px = _xz_to_lidar_px(xz_pts)
+        ply_px   = _apply_M(chosen_M, lidar_px)
+        world    = np.empty_like(ply_px, dtype=float)
+        world[:, 0] = px0 + ply_px[:, 0] * (px1 - px0) / pW
+        world[:, 1] = py1 - ply_px[:, 1] * (py1 - py0) / pH
+        return world
+
+    # --- debug_img: PLY render with green polygon ---
+    ply_px_result = _apply_M(chosen_M, yellow_lidar_px).astype(np.int32)
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_result.reshape(-1, 1, 2)],
+                  isClosed=True, color=(0, 255, 0), thickness=4)
+
+    # --- pca_axes: PCA axes + DEM floor centroid markers on both panels ---
+    li_panel = _draw_pca_axes_on_render(
+        lidar_render, cx_li, ang_li, std_main_li, std_perp_li, "LiDAR")
+    cv2.polylines(li_panel, [yellow_lidar_px.astype(np.int32).reshape(-1, 1, 2)],
+                  True, (0, 255, 255), 3)
+    cv2.drawMarker(li_panel, (int(lidar_fc_px[0]), int(lidar_fc_px[1])),
+                   (255, 100, 0), cv2.MARKER_CROSS, 40, 4)
+
+    pl_panel = _draw_pca_axes_on_render(
+        ply_render, cx_pl, ang_pl, std_main_pl, std_perp_pl, "PLY")
+    cv2.drawMarker(pl_panel, (int(ply_fc_px[0]), int(ply_fc_px[1])),
+                   (255, 100, 0), cv2.MARKER_CROSS, 40, 4)
+
+    if li_panel.shape[0] != pl_panel.shape[0]:
+        tH = pl_panel.shape[0]
+        tW = int(li_panel.shape[1] * tH / li_panel.shape[0])
+        li_panel = cv2.resize(li_panel, (tW, tH))
+    pca_axes_img = np.hstack([li_panel, pl_panel])
+
+    lidar_vs_result = _make_lidar_vs_result(
+        lidar_render, yellow_lidar_px, ply_render, ply_px_result,
+        "PLY (hybrid: PCA rot + DEM floor centroid)")
+
+    return transform_fn, debug_img, note, {
+        "pca_axes": pca_axes_img,
+        "lidar_vs_result": lidar_vs_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Experimental registration methods (branch: automate-snipping-fix-shift)
+# All share this return signature:
+#   (transform_fn, debug_img, note, {"lidar_vs_result": img})
+# ---------------------------------------------------------------------------
+
+def _pca_rotation_candidates(lidar_render, ply_render, scale=1.0):
+    """Return [(rot_deg, c, s, tx, ty), ...] for both 180° ambiguity options."""
+    cx_li, ang_li, sml_li, spr_li = _pca_footprint(lidar_render)
+    cx_pl, ang_pl, sml_pl, spr_pl = _pca_footprint(ply_render)
+    rot0 = ang_pl - ang_li
+    out = []
+    for rot in [rot0, rot0 + 180]:
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx = cx_pl[0] - scale*(c*cx_li[0] - s*cx_li[1])
+        ty = cx_pl[1] - scale*(s*cx_li[0] + c*cx_li[1])
+        out.append((rot, c, s, tx, ty))
+    return out, (cx_li, ang_li), (cx_pl, ang_pl)
+
+
+# Method 1 ─────────────────────────────────────────────────────────────────
+def register_lidar_to_ply_world_phase_corr(
+    lidar_render: np.ndarray,
+    lidar_xz_bbox: tuple,
+    ply_render: np.ndarray,
+    ply_world_bbox: tuple,
+    xz_polygon: np.ndarray,
+) -> tuple:
+    """PCA rotation + phase-correlation residual translation on Canny edge images.
+
+    After rotating LiDAR into PLY space via PCA, FFT cross-correlates the two
+    Canny edge images to find the remaining translational offset.
+    """
+    cx_li, ang_li, sml_li, spr_li = _pca_footprint(lidar_render)
+    cx_pl, ang_pl, sml_pl, spr_pl = _pca_footprint(ply_render)
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    def _xz_to_li_px(xz):
+        return np.stack([(xz[:,0]-lx0)/(lx1-lx0)*lW,
+                         (xz[:,1]-lz0)/(lz1-lz0)*lH], axis=1)
+
+    ply_gray  = cv2.cvtColor(ply_render, cv2.COLOR_BGR2GRAY)
+    ply_edges = cv2.Canny(ply_gray, 30, 120).astype(np.float32)
+    yellow_lidar_px = _xz_to_li_px(xz_polygon)
+    rot0 = ang_pl - ang_li
+    best_M, best_note, best_resp = None, "", -1.0
+
+    for rot in [rot0, rot0 + 180]:
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx0 = cx_pl[0] - (c*cx_li[0] - s*cx_li[1])
+        ty0 = cx_pl[1] - (s*cx_li[0] + c*cx_li[1])
+        M0  = np.array([[c, -s, tx0], [s, c, ty0]], dtype=np.float64)
+
+        warped  = cv2.warpAffine(lidar_render, M0, (pW, pH))
+        w_gray  = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        w_edges = cv2.Canny(w_gray, 30, 120).astype(np.float32)
+
+        (dx, dy), resp = cv2.phaseCorrelate(ply_edges, w_edges)
+        print(f"  [PhaseCorr] rot={rot:.1f}°  offset=({dx:.1f},{dy:.1f})  resp={resp:.4f}")
+
+        if resp > best_resp:
+            best_resp = resp
+            best_M    = np.array([[c, -s, tx0+dx], [s, c, ty0+dy],
+                                   [0,  0,       1]], dtype=np.float64)
+            best_note = f"PhaseCorr rot={rot:.1f}° off=({dx:.0f},{dy:.0f}) resp={resp:.3f}"
+
+    def _apply(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    ply_px_r = _apply(best_M, yellow_lidar_px).astype(np.int32)
+
+    def transform_fn(xz_pts):
+        lp = _xz_to_li_px(xz_pts)
+        pp = _apply(best_M, lp)
+        world = np.empty((len(pp), 2))
+        world[:,0] = px0 + pp[:,0]*(px1-px0)/pW
+        world[:,1] = py1 - pp[:,1]*(py1-py0)/pH
+        return world
+
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_r.reshape(-1,1,2)], True, (0,255,0), 4)
+    lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
+                                f"PLY ({best_note})")
+    print(f"  [PhaseCorr] {best_note}")
+    return transform_fn, debug_img, best_note, {"lidar_vs_result": lvr}
+
+
+# Method 2 ─────────────────────────────────────────────────────────────────
+def register_lidar_to_ply_world_prerot_akaze(
+    lidar_render: np.ndarray,
+    lidar_xz_bbox: tuple,
+    ply_render: np.ndarray,
+    ply_world_bbox: tuple,
+    xz_polygon: np.ndarray,
+) -> tuple:
+    """PCA-rotated LiDAR render + AKAZE feature matching for residual correction.
+
+    Pre-applying PCA rotation aligns descriptors to the same orientation before
+    matching, which greatly improves inlier count vs. raw SIFT/AKAZE.
+    """
+    cx_li, ang_li, sml_li, spr_li = _pca_footprint(lidar_render)
+    cx_pl, ang_pl, sml_pl, spr_pl = _pca_footprint(ply_render)
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    def _xz_to_li_px(xz):
+        return np.stack([(xz[:,0]-lx0)/(lx1-lx0)*lW,
+                         (xz[:,1]-lz0)/(lz1-lz0)*lH], axis=1)
+
+    yellow_lidar_px = _xz_to_li_px(xz_polygon)
+    rot0 = ang_pl - ang_li
+
+    akaze = cv2.AKAZE_create()
+    kp2, des2 = akaze.detectAndCompute(ply_render, None)
+    if des2 is None or len(kp2) < 10:
+        raise RuntimeError("AKAZE: too few features in PLY render")
+
+    best_M3, best_note, best_inliers = None, "", -1
+
+    for rot in [rot0, rot0 + 180]:
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx0 = cx_pl[0] - (c*cx_li[0] - s*cx_li[1])
+        ty0 = cx_pl[1] - (s*cx_li[0] + c*cx_li[1])
+        M0_2x3 = np.array([[c, -s, tx0], [s, c, ty0]], dtype=np.float64)
+        M0_3x3 = np.vstack([M0_2x3, [0,0,1]])
+
+        warped = cv2.warpAffine(lidar_render, M0_2x3, (pW, pH))
+        wmask  = (cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) > 10).astype(np.uint8)
+
+        kp1, des1 = akaze.detectAndCompute(warped, wmask)
+        n_kp = len(kp1) if kp1 else 0
+        if des1 is None or n_kp < 8:
+            print(f"  [PreRotAKAZE] rot={rot:.1f}°  too few kps ({n_kp})")
+            continue
+
+        bf   = cv2.BFMatcher(cv2.NORM_HAMMING)
+        raw  = bf.knnMatch(des1, des2, k=2)
+        good = [m for m,n in raw if m.distance < 0.75*n.distance]
+        print(f"  [PreRotAKAZE] rot={rot:.1f}°  kp={n_kp}  good={len(good)}")
+        if len(good) < 6:
+            continue
+
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
+        A_corr, mask_r = cv2.estimateAffinePartial2D(
+            pts1, pts2, method=cv2.RANSAC, ransacReprojThreshold=12.0,
+            confidence=0.995, maxIters=2000)
+        if A_corr is None:
+            continue
+        inliers = int(mask_r.sum()) if mask_r is not None else 0
+        print(f"  [PreRotAKAZE] RANSAC inliers={inliers}")
+        if inliers > best_inliers:
+            best_inliers = inliers
+            A3 = np.vstack([A_corr, [0,0,1]])
+            best_M3  = A3 @ M0_3x3
+            best_note = f"PreRotAKAZE rot={rot:.1f}° inliers={inliers}"
+
+    if best_M3 is None:
+        raise RuntimeError("Pre-rotated AKAZE: no valid transform found")
+
+    def _apply(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    ply_px_r = _apply(best_M3, yellow_lidar_px).astype(np.int32)
+
+    def transform_fn(xz_pts):
+        lp = _xz_to_li_px(xz_pts)
+        pp = _apply(best_M3, lp)
+        world = np.empty((len(pp), 2))
+        world[:,0] = px0 + pp[:,0]*(px1-px0)/pW
+        world[:,1] = py1 - pp[:,1]*(py1-py0)/pH
+        return world
+
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_r.reshape(-1,1,2)], True, (0,255,0), 4)
+    lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
+                                f"PLY ({best_note})")
+    print(f"  [PreRotAKAZE] {best_note}")
+    return transform_fn, debug_img, best_note, {"lidar_vs_result": lvr}
+
+
+# Method 3 ─────────────────────────────────────────────────────────────────
+def register_lidar_to_ply_world_annot_boundary(
+    lidar_render: np.ndarray,
+    lidar_xz_bbox: tuple,
+    ply_render: np.ndarray,
+    ply_world_bbox: tuple,
+    xz_polygon: np.ndarray,
+) -> tuple:
+    """Phase correlate the annotation polygon boundary against PLY Canny edges.
+
+    The E-shaped annotation was painted along physical wall boundaries.  Its
+    rotated outline should align with structural edges in the PLY render.
+    This uses the annotation geometry as a known probe to find the translation
+    directly, without relying on general scene statistics.
+    """
+    cx_li, ang_li, sml_li, spr_li = _pca_footprint(lidar_render)
+    cx_pl, ang_pl, sml_pl, spr_pl = _pca_footprint(ply_render)
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    def _xz_to_li_px(xz):
+        return np.stack([(xz[:,0]-lx0)/(lx1-lx0)*lW,
+                         (xz[:,1]-lz0)/(lz1-lz0)*lH], axis=1)
+
+    yellow_lidar_px = _xz_to_li_px(xz_polygon)
+    rot0 = ang_pl - ang_li
+
+    li_bnd = np.zeros((lH, lW), dtype=np.uint8)
+    cv2.polylines(li_bnd, [yellow_lidar_px.astype(np.int32).reshape(-1,1,2)],
+                  True, 255, 5)
+    li_bnd = cv2.dilate(li_bnd, np.ones((7,7), np.uint8)).astype(np.float32)
+
+    ply_gray   = cv2.cvtColor(ply_render, cv2.COLOR_BGR2GRAY)
+    ply_edges  = cv2.Canny(ply_gray, 30, 120).astype(np.float32)
+    ply_edges_d = cv2.dilate(ply_edges, np.ones((5,5), np.uint8)).astype(np.float32)
+
+    best_M, best_note, best_resp = None, "", -1.0
+
+    for rot in [rot0, rot0 + 180]:
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx0 = cx_pl[0] - (c*cx_li[0] - s*cx_li[1])
+        ty0 = cx_pl[1] - (s*cx_li[0] + c*cx_li[1])
+        M0 = np.array([[c, -s, tx0], [s, c, ty0]], dtype=np.float64)
+
+        rotated_bnd = cv2.warpAffine(li_bnd, M0, (pW, pH))
+        (dx, dy), resp = cv2.phaseCorrelate(ply_edges_d, rotated_bnd)
+        print(f"  [AnnotBndry] rot={rot:.1f}°  offset=({dx:.1f},{dy:.1f})  resp={resp:.4f}")
+
+        if resp > best_resp:
+            best_resp = resp
+            best_M    = np.array([[c, -s, tx0+dx], [s, c, ty0+dy],
+                                   [0,  0,       1]], dtype=np.float64)
+            best_note = f"AnnotBndry rot={rot:.1f}° off=({dx:.0f},{dy:.0f}) resp={resp:.3f}"
+
+    def _apply(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    ply_px_r = _apply(best_M, yellow_lidar_px).astype(np.int32)
+
+    def transform_fn(xz_pts):
+        lp = _xz_to_li_px(xz_pts)
+        pp = _apply(best_M, lp)
+        world = np.empty((len(pp), 2))
+        world[:,0] = px0 + pp[:,0]*(px1-px0)/pW
+        world[:,1] = py1 - pp[:,1]*(py1-py0)/pH
+        return world
+
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_r.reshape(-1,1,2)], True, (0,255,0), 4)
+    lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
+                                f"PLY ({best_note})")
+    print(f"  [AnnotBndry] {best_note}")
+    return transform_fn, debug_img, best_note, {"lidar_vs_result": lvr}
+
+
+# Method 4 ─────────────────────────────────────────────────────────────────
+def _pca_footprint_dist_weighted(render_bgr: np.ndarray) -> tuple:
+    """PCA on non-black pixels weighted by (distance from scan boundary)².
+
+    Interior pixels dominate; peripheral regions that differ between LiDAR and
+    PLY captures are suppressed, making the centroid more stable.
+    """
+    gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
+    mask = (gray > 10).astype(np.uint8)
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5).astype(np.float32)
+    w_img = dist ** 2
+
+    ys, xs = np.where(mask > 0)
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    w   = w_img[ys, xs].astype(np.float64)
+    w  /= w.sum()
+
+    center = (pts * w[:, np.newaxis]).sum(axis=0)
+    pts_c  = pts - center
+    wcov   = (pts_c * w[:, np.newaxis]).T @ pts_c
+    eigval, eigvec = np.linalg.eigh(wcov)
+    main   = eigvec[:, -1]
+    angle  = float(np.degrees(np.arctan2(main[1], main[0])))
+    return center, angle, float(np.sqrt(eigval[-1])), float(np.sqrt(eigval[0]))
+
+
+def register_lidar_to_ply_world_dist_pca(
+    lidar_render: np.ndarray,
+    lidar_xz_bbox: tuple,
+    ply_render: np.ndarray,
+    ply_world_bbox: tuple,
+    xz_polygon: np.ndarray,
+) -> tuple:
+    """RGB PCA registration using a distance-weighted interior centroid.
+
+    Pixels weighted by squared distance from the scan boundary so the centroid
+    reflects the shared interior of the scene, not peripheral scan extensions.
+    """
+    cx_li, ang_li, sml_li, spr_li = _pca_footprint_dist_weighted(lidar_render)
+    cx_pl, ang_pl, sml_pl, spr_pl = _pca_footprint_dist_weighted(ply_render)
+    scale = 1.0
+
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    print(f"  [DistPCA] LiDAR wt-centre=({cx_li[0]:.0f},{cx_li[1]:.0f}) angle={ang_li:.1f}°")
+    print(f"  [DistPCA] PLY   wt-centre=({cx_pl[0]:.0f},{cx_pl[1]:.0f}) angle={ang_pl:.1f}°")
+
+    def _xz_to_li_px(xz):
+        return np.stack([(xz[:,0]-lx0)/(lx1-lx0)*lW,
+                         (xz[:,1]-lz0)/(lz1-lz0)*lH], axis=1)
+
+    def _make_M3(rot):
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx = cx_pl[0] - (c*cx_li[0] - s*cx_li[1])
+        ty = cx_pl[1] - (s*cx_li[0] + c*cx_li[1])
+        return np.array([[c, -s, tx], [s, c, ty], [0, 0, 1]], dtype=np.float64)
+
+    def _apply(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    def _within(rpts, margin=0.15):
+        return (rpts[:,0].min() > -pW*margin and rpts[:,0].max() < pW*(1+margin) and
+                rpts[:,1].min() > -pH*margin and rpts[:,1].max() < pH*(1+margin))
+
+    yellow_lidar_px = _xz_to_li_px(xz_polygon)
+    rot0 = ang_pl - ang_li
+    chosen_M3, note = None, ""
+    for rot in [rot0, rot0 + 180]:
+        M3 = _make_M3(rot)
+        if _within(_apply(M3, yellow_lidar_px)):
+            note      = f"DistPCA rot={rot:.1f}°"
+            chosen_M3 = M3
+            break
+    if chosen_M3 is None:
+        chosen_M3 = _make_M3(rot0)
+        note = f"DistPCA rot={rot0:.1f}° (fallback)"
+    print(f"  [DistPCA] {note}")
+
+    ply_px_r = _apply(chosen_M3, yellow_lidar_px).astype(np.int32)
+
+    def transform_fn(xz_pts):
+        lp = _xz_to_li_px(xz_pts)
+        pp = _apply(chosen_M3, lp)
+        world = np.empty((len(pp), 2))
+        world[:,0] = px0 + pp[:,0]*(px1-px0)/pW
+        world[:,1] = py1 - pp[:,1]*(py1-py0)/pH
+        return world
+
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_r.reshape(-1,1,2)], True, (0,255,0), 4)
+    lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
+                                f"PLY ({note})")
+    return transform_fn, debug_img, note, {"lidar_vs_result": lvr}
+
+
+# ---------------------------------------------------------------------------
+# Shared coarse-to-fine pose search (used by chamfer / MI / DEM-ridge methods)
+# ---------------------------------------------------------------------------
+
+def _pts_pca_2d(pts: np.ndarray) -> tuple:
+    """Return (center(2,), angle_deg) of the principal axis of a 2D point set."""
+    center = pts.mean(axis=0)
+    pc = pts - center
+    cov = pc.T @ pc
+    eigval, eigvec = np.linalg.eigh(cov)
+    main = eigvec[:, -1]
+    angle = float(np.degrees(np.arctan2(main[1], main[0])))
+    return center, angle
+
+
+def _search_pose(cost_fn, src_center, dst_center, rot0,
+                 both_flips=True,
+                 coarse_rot=(-20, 20, 4), coarse_trans=(-250, 250, 25),
+                 fine_rot=(-4, 4, 1), fine_trans=(-25, 25, 5)):
+    """Coarse-to-fine search for the rigid pose (rotation + translation) that
+    minimises cost_fn(M3).
+
+    The 3x3 matrix maps src px → dst px as a rotation about src_center that lands
+    src_center on dst_center + (dx, dy):
+        M3 = R, t = dst_center + (dx,dy) - R @ src_center
+    cost_fn must return a scalar (lower = better).  Returns (best_M3, best_cost,
+    best_rot_deg).
+    """
+    sx, sy = float(src_center[0]), float(src_center[1])
+    dx0, dy0 = float(dst_center[0]), float(dst_center[1])
+
+    def make_M3(rot, dx, dy):
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx = dx0 + dx - (c*sx - s*sy)
+        ty = dy0 + dy - (s*sx + c*sy)
+        return np.array([[c, -s, tx], [s, c, ty], [0, 0, 1]], dtype=np.float64)
+
+    rot_bases = [rot0, rot0 + 180] if both_flips else [rot0]
+
+    best = (np.inf, None, rot0, 0.0, 0.0)
+    cr = np.arange(coarse_rot[0], coarse_rot[1] + 1e-6, coarse_rot[2])
+    ct = np.arange(coarse_trans[0], coarse_trans[1] + 1e-6, coarse_trans[2])
+    for rb in rot_bases:
+        for drot in cr:
+            rot = rb + drot
+            for dx in ct:
+                for dy in ct:
+                    M = make_M3(rot, dx, dy)
+                    c = cost_fn(M)
+                    if c < best[0]:
+                        best = (c, M, rot, dx, dy)
+
+    _, _, brot, bdx, bdy = best
+    fr = np.arange(fine_rot[0], fine_rot[1] + 1e-6, fine_rot[2])
+    ft = np.arange(fine_trans[0], fine_trans[1] + 1e-6, fine_trans[2])
+    for drot in fr:
+        rot = brot + drot
+        for dx in np.arange(bdx + ft[0], bdx + ft[-1] + 1e-6, fine_trans[2]):
+            for dy in np.arange(bdy + ft[0], bdy + ft[-1] + 1e-6, fine_trans[2]):
+                M = make_M3(rot, dx, dy)
+                c = cost_fn(M)
+                if c < best[0]:
+                    best = (c, M, rot, dx, dy)
+
+    return best[1], best[0], best[2]
+
+
+def _densify_polygon(pts: np.ndarray, step: float = 3.0) -> np.ndarray:
+    """Resample a closed polygon into points spaced ~`step` px along its edges."""
+    out = []
+    n = len(pts)
+    for i in range(n):
+        a = pts[i]; b = pts[(i + 1) % n]
+        seg = b - a
+        L = float(np.hypot(seg[0], seg[1]))
+        k = max(int(L / step), 1)
+        for j in range(k):
+            out.append(a + seg * (j / k))
+    return np.asarray(out, dtype=np.float64)
+
+
+# Method 5 ─────────────────────────────────────────────────────────────────
+def register_lidar_to_ply_world_chamfer(
+    lidar_render: np.ndarray,
+    lidar_xz_bbox: tuple,
+    ply_render: np.ndarray,
+    ply_world_bbox: tuple,
+    xz_polygon: np.ndarray,
+) -> tuple:
+    """Chamfer-match the annotation E-shape against PLY wall edges.
+
+    Rotation is fixed to the PCA-validated value (which is known to be correct).
+    Only translation is searched — the 2-DOF problem is well-posed even against
+    dense edges, while free-rotation search in clutter will snap to any coincident
+    edge pattern regardless of semantic correctness.
+    """
+    cx_li, ang_li, _, _ = _pca_footprint(lidar_render)
+    cx_pl, ang_pl, _, _ = _pca_footprint(ply_render)
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    def _xz_to_li_px(xz):
+        return np.stack([(xz[:,0]-lx0)/(lx1-lx0)*lW,
+                         (xz[:,1]-lz0)/(lz1-lz0)*lH], axis=1)
+
+    # PLY edge distance transform (distance to nearest wall edge)
+    ply_gray  = cv2.cvtColor(ply_render, cv2.COLOR_BGR2GRAY)
+    ply_edges = cv2.Canny(ply_gray, 30, 120)
+    ply_edges = cv2.dilate(ply_edges, np.ones((3,3), np.uint8))
+    dt = cv2.distanceTransform(255 - ply_edges, cv2.DIST_L2, 5).astype(np.float32)
+    PENALTY = float(dt.max()) * 2.0
+
+    yellow_lidar_px = _xz_to_li_px(xz_polygon)
+    poly_pts = _densify_polygon(yellow_lidar_px, step=3.0)
+    homog = np.column_stack([poly_pts, np.ones(len(poly_pts))])
+
+    def cost_fn(M3):
+        pp = (M3 @ homog.T).T[:, :2]
+        xs = np.round(pp[:,0]).astype(np.int32)
+        ys = np.round(pp[:,1]).astype(np.int32)
+        inb = (xs >= 0) & (xs < pW) & (ys >= 0) & (ys < pH)
+        if inb.sum() < 0.3 * len(pp):
+            return PENALTY
+        vals = np.full(len(pp), PENALTY, dtype=np.float32)
+        vals[inb] = dt[ys[inb], xs[inb]]
+        return float(vals.mean())
+
+    def _within(pts, margin=0.15):
+        return (pts[:,0].min() > -pW*margin and pts[:,0].max() < pW*(1+margin) and
+                pts[:,1].min() > -pH*margin and pts[:,1].max() < pH*(1+margin))
+
+    def _make_M3_zero_dt(rot):
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx = cx_pl[0] - (c*cx_li[0] - s*cx_li[1])
+        ty = cx_pl[1] - (s*cx_li[0] + c*cx_li[1])
+        return np.array([[c, -s, tx], [s, c, ty], [0, 0, 1]], dtype=np.float64)
+
+    def _apply0(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    # Determine the correct 180° flip from PCA (polygon must land inside render)
+    rot0 = ang_pl - ang_li
+    fixed_rot = rot0
+    for rot_candidate in [rot0, rot0 + 180]:
+        if _within(_apply0(_make_M3_zero_dt(rot_candidate), yellow_lidar_px)):
+            fixed_rot = rot_candidate
+            break
+    print(f"  [Chamfer] locked rot={fixed_rot:.1f}° — searching translation only")
+
+    # Translation-only search: coarse_rot=(0,0,1) → only drot=0 is tried
+    best_M3, best_cost, best_rot = _search_pose(
+        cost_fn, cx_li, cx_pl, fixed_rot,
+        both_flips=False,
+        coarse_rot=(0, 0, 1), fine_rot=(0, 0, 1),
+        coarse_trans=(-300, 300, 20), fine_trans=(-20, 20, 4))
+    note = f"Chamfer rot={best_rot:.1f}° meanDist={best_cost:.2f}px"
+    print(f"  [Chamfer] {note}")
+
+    def _apply(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    ply_px_r = _apply(best_M3, yellow_lidar_px).astype(np.int32)
+
+    def transform_fn(xz_pts):
+        pp = _apply(best_M3, _xz_to_li_px(xz_pts))
+        world = np.empty((len(pp), 2))
+        world[:,0] = px0 + pp[:,0]*(px1-px0)/pW
+        world[:,1] = py1 - pp[:,1]*(py1-py0)/pH
+        return world
+
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_r.reshape(-1,1,2)], True, (0,255,0), 4)
+    lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
+                                f"PLY ({note})")
+    return transform_fn, debug_img, note, {"lidar_vs_result": lvr}
+
+
+# Method 6 ─────────────────────────────────────────────────────────────────
+def _mutual_information(a: np.ndarray, b: np.ndarray, mask: np.ndarray,
+                        bins: int = 32) -> float:
+    """Mutual information between two gray images over a boolean mask."""
+    av = a[mask].astype(np.float64)
+    bv = b[mask].astype(np.float64)
+    hist, _, _ = np.histogram2d(av, bv, bins=bins, range=[[0, 256], [0, 256]])
+    pab = hist / max(hist.sum(), 1.0)
+    pa = pab.sum(axis=1)
+    pb = pab.sum(axis=0)
+    nz = pab > 0
+    denom = (pa[:, None] * pb[None, :])
+    return float((pab[nz] * np.log(pab[nz] / denom[nz])).sum())
+
+
+def register_lidar_to_ply_world_mutual_info(
+    lidar_render: np.ndarray,
+    lidar_xz_bbox: tuple,
+    ply_render: np.ndarray,
+    ply_world_bbox: tuple,
+    xz_polygon: np.ndarray,
+) -> tuple:
+    """Maximise mutual information between the PLY and warped LiDAR gray images.
+
+    The textbook multimodal-registration approach: MI rewards statistical
+    coupling between the two intensity patterns without requiring them to look
+    alike.  Search runs in a downsampled space for speed, then the matrix is
+    scaled back to full render resolution.
+    """
+    cx_li, ang_li, _, _ = _pca_footprint(lidar_render)
+    cx_pl, ang_pl, _, _ = _pca_footprint(ply_render)
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    def _xz_to_li_px(xz):
+        return np.stack([(xz[:,0]-lx0)/(lx1-lx0)*lW,
+                         (xz[:,1]-lz0)/(lz1-lz0)*lH], axis=1)
+
+    # Downsample to ~400 px max dim for speed
+    f = 400.0 / max(pH, pW, lH, lW)
+    f = min(f, 1.0)
+    li_small = cv2.resize(cv2.cvtColor(lidar_render, cv2.COLOR_BGR2GRAY),
+                          None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+    pl_small = cv2.resize(cv2.cvtColor(ply_render, cv2.COLOR_BGR2GRAY),
+                          None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+    pH_s, pW_s = pl_small.shape
+    pl_mask = pl_small > 10
+
+    def cost_fn(M3_small):
+        M2 = M3_small[:2, :]
+        warped = cv2.warpAffine(li_small, M2, (pW_s, pH_s))
+        mask = pl_mask & (warped > 10)
+        if mask.sum() < 0.05 * pl_mask.sum():
+            return 1e6
+        return -_mutual_information(pl_small, warped, mask)
+
+    rot0 = ang_pl - ang_li
+    # search in small-image coords: scale the PCA centers down
+    src_c = cx_li * f
+    dst_c = cx_pl * f
+    best_M3s, best_cost, best_rot = _search_pose(
+        cost_fn, src_c, dst_c, rot0,
+        coarse_trans=(-100, 100, 12), fine_trans=(-12, 12, 3))
+
+    # scale matrix back up to full render px:  M_full = D(1/f) M_small D(f)
+    Sf  = np.diag([f, f, 1.0])
+    Sif = np.diag([1.0/f, 1.0/f, 1.0])
+    best_M3 = Sif @ best_M3s @ Sf
+    note = f"MutualInfo rot={best_rot:.1f}° MI={-best_cost:.3f}"
+    print(f"  [MutualInfo] {note}")
+
+    def _apply(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    yellow_lidar_px = _xz_to_li_px(xz_polygon)
+    ply_px_r = _apply(best_M3, yellow_lidar_px).astype(np.int32)
+
+    def transform_fn(xz_pts):
+        pp = _apply(best_M3, _xz_to_li_px(xz_pts))
+        world = np.empty((len(pp), 2))
+        world[:,0] = px0 + pp[:,0]*(px1-px0)/pW
+        world[:,1] = py1 - pp[:,1]*(py1-py0)/pH
+        return world
+
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_r.reshape(-1,1,2)], True, (0,255,0), 4)
+    lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
+                                f"PLY ({note})")
+    return transform_fn, debug_img, note, {"lidar_vs_result": lvr}
+
+
+# Method 7 ─────────────────────────────────────────────────────────────────
+def _ridge_mask_from_grid(grid: np.ndarray, pct: float = 90.0) -> np.ndarray:
+    """High-slope ridge cells of a height grid (NaN = empty).  Returns (rr, cc)."""
+    valid = ~np.isnan(grid)
+    fill = float(np.nanmin(grid)) if valid.any() else 0.0
+    g = np.where(valid, grid, fill).astype(np.float32)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    # suppress artificial gradients at the valid/empty boundary
+    inner = cv2.erode(valid.astype(np.uint8), np.ones((3,3), np.uint8)).astype(bool)
+    mag[~inner] = 0.0
+    if not inner.any():
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    thr = np.percentile(mag[inner], pct)
+    return np.where((mag >= thr) & inner)
+
+
+def register_lidar_to_ply_world_dem_ridge(
+    lidar_pts: np.ndarray,
+    lidar_xz_bbox: tuple,
+    dem_path: str,
+    ply_world_bbox: tuple,
+    lidar_render: np.ndarray,
+    ply_render: np.ndarray,
+    xz_polygon: np.ndarray,
+    lidar_cell_size: float = 0.02,
+    ridge_pct: float = 90.0,
+) -> tuple:
+    """Register via DEM slope-ridge structure (walls = high-gradient ridges).
+
+    Wall edges appear as sharp slope ridges in BOTH the LiDAR-derived height grid
+    and the GeoTIFF DEM, regardless of absolute elevation or scan extent.  Build
+    ridge images for each (in PLY render px), then chamfer-search the LiDAR ridge
+    points against the PLY ridge distance transform.
+    """
+    from osgeo import gdal
+    gdal.UseExceptions()
+
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    def _xz_to_li_px(xz):
+        return np.stack([(xz[:,0]-lx0)/(lx1-lx0)*lW,
+                         (xz[:,1]-lz0)/(lz1-lz0)*lH], axis=1)
+
+    # --- LiDAR ridge cells → LiDAR render px ---
+    _, lidar_dem, (lgx0, lgz0) = _compute_lidar_dem_wall_pts(
+        lidar_pts, cell_size=lidar_cell_size)
+    lrr, lcc = _ridge_mask_from_grid(lidar_dem, pct=ridge_pct)
+    if len(lrr) == 0:
+        raise RuntimeError("DEM-ridge: no LiDAR ridge cells")
+    lidar_xz = np.stack([lgx0 + lcc * lidar_cell_size,
+                         lgz0 + lrr * lidar_cell_size], axis=1)
+    ridge_li_px = _xz_to_li_px(lidar_xz)
+
+    # --- GeoTIFF ridge cells → PLY local XY → PLY render px ---
+    ds = gdal.Open(dem_path)
+    gt = ds.GetGeoTransform()
+    W_d, H_d = ds.RasterXSize, ds.RasterYSize
+    band = ds.GetRasterBand(1)
+    nodata = band.GetNoDataValue()
+    dem = band.ReadAsArray().astype(np.float32)
+    if nodata is not None:
+        dem[dem == nodata] = np.nan
+    dem_utm_x0 = gt[0]
+    dem_utm_y_top = gt[3]
+    dem_utm_y_bot = gt[3] + gt[5] * H_d
+    offset_x = dem_utm_x0 - px0
+    offset_y = dem_utm_y_bot - py0
+
+    grr, gcc = _ridge_mask_from_grid(dem, pct=ridge_pct)
+    if len(grr) == 0:
+        raise RuntimeError("DEM-ridge: no GeoTIFF ridge cells")
+    utm_x = dem_utm_x0 + gcc * gt[1]
+    utm_y = dem_utm_y_top + grr * gt[5]
+    local_x = utm_x - offset_x
+    local_y = utm_y - offset_y
+    ply_ridge_px = np.stack([(local_x - px0)/(px1-px0)*pW,
+                             (py1 - local_y)/(py1-py0)*pH], axis=1)
+    print(f"  [DEMRidge] LiDAR ridge cells={len(lrr)}  GeoTIFF ridge cells={len(grr)}")
+
+    # PLY ridge image → distance transform
+    ridge_img = np.zeros((pH, pW), dtype=np.uint8)
+    inb = ((ply_ridge_px[:,0] >= 0) & (ply_ridge_px[:,0] < pW) &
+           (ply_ridge_px[:,1] >= 0) & (ply_ridge_px[:,1] < pH))
+    pr = ply_ridge_px[inb].astype(np.int32)
+    ridge_img[pr[:,1], pr[:,0]] = 255
+    ridge_img = cv2.dilate(ridge_img, np.ones((3,3), np.uint8))
+    dt = cv2.distanceTransform(255 - ridge_img, cv2.DIST_L2, 5).astype(np.float32)
+    PENALTY = float(dt.max()) * 2.0
+
+    # subsample LiDAR ridge points for cost speed
+    if len(ridge_li_px) > 800:
+        idx = np.random.RandomState(0).choice(len(ridge_li_px), 800, replace=False)
+        cost_pts = ridge_li_px[idx]
+    else:
+        cost_pts = ridge_li_px
+    homog = np.column_stack([cost_pts, np.ones(len(cost_pts))])
+
+    def cost_fn(M3):
+        pp = (M3 @ homog.T).T[:, :2]
+        xs = np.round(pp[:,0]).astype(np.int32)
+        ys = np.round(pp[:,1]).astype(np.int32)
+        ok = (xs >= 0) & (xs < pW) & (ys >= 0) & (ys < pH)
+        if ok.sum() < 0.3 * len(pp):
+            return PENALTY
+        vals = np.full(len(pp), PENALTY, dtype=np.float32)
+        vals[ok] = dt[ys[ok], xs[ok]]
+        return float(vals.mean())
+
+    # Lock rotation to PCA-validated render-based estimate; search translation only.
+    # The DEM ridge PCA is under-constrained (381k GeoTIFF cells vs 239 LiDAR cells),
+    # so we don't trust it for rotation — use the render PCA which is known-good.
+    cx_li_r, ang_li_r, _, _ = _pca_footprint(lidar_render)
+    cx_pl_r, ang_pl_r, _, _ = _pca_footprint(ply_render)
+    rot0 = ang_pl_r - ang_li_r
+
+    def _within_r(pts, margin=0.15):
+        return (pts[:,0].min() > -pW*margin and pts[:,0].max() < pW*(1+margin) and
+                pts[:,1].min() > -pH*margin and pts[:,1].max() < pH*(1+margin))
+
+    def _make_M3_r(rot):
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx = cx_pl_r[0] - (c*cx_li_r[0] - s*cx_li_r[1])
+        ty = cx_pl_r[1] - (s*cx_li_r[0] + c*cx_li_r[1])
+        return np.array([[c, -s, tx], [s, c, ty], [0, 0, 1]], dtype=np.float64)
+
+    def _apply_r(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    yellow_lidar_px_r = _xz_to_li_px(xz_polygon)
+    fixed_rot = rot0
+    for rc in [rot0, rot0 + 180]:
+        if _within_r(_apply_r(_make_M3_r(rc), yellow_lidar_px_r)):
+            fixed_rot = rc
+            break
+    print(f"  [DEMRidge] locked rot={fixed_rot:.1f}° — searching translation only")
+
+    best_M3, best_cost, best_rot = _search_pose(
+        cost_fn, cx_li_r, cx_pl_r, fixed_rot,
+        both_flips=False,
+        coarse_rot=(0, 0, 1), fine_rot=(0, 0, 1),
+        coarse_trans=(-300, 300, 20), fine_trans=(-20, 20, 4))
+    note = f"DEMRidge rot={best_rot:.1f}° meanDist={best_cost:.2f}px"
+    print(f"  [DEMRidge] {note}")
+
+    def _apply(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    yellow_lidar_px = _xz_to_li_px(xz_polygon)
+    ply_px_r = _apply(best_M3, yellow_lidar_px).astype(np.int32)
+
+    def transform_fn(xz_pts):
+        pp = _apply(best_M3, _xz_to_li_px(xz_pts))
+        world = np.empty((len(pp), 2))
+        world[:,0] = px0 + pp[:,0]*(px1-px0)/pW
+        world[:,1] = py1 - pp[:,1]*(py1-py0)/pH
+        return world
+
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_r.reshape(-1,1,2)], True, (0,255,0), 4)
+    lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
+                                f"PLY ({note})")
+    return transform_fn, debug_img, note, {"lidar_vs_result": lvr}
 
 
 # ---------------------------------------------------------------------------

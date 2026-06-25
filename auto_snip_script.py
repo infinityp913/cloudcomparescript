@@ -388,76 +388,87 @@ if __name__ == "__main__":
                     os.path.join(output_dir, f"debug_SU{su_number}_lidar_yellow.png"),
                 )
 
-                # Find GeoTIFF DEM for the top job
+                # ------------------------------------------------------------------
+                # Registration cascade:
+                #   1. Hybrid: RGB PCA rotation + DEM floor centroid translation
+                #   2. Fallback: plain RGB footprint PCA
+                # ICP comparison always runs afterwards (result logged but not
+                # used for the crop so we can compare the two outputs).
+                # ------------------------------------------------------------------
                 dem_path = os.path.join(DATA_DIR, "DEMs", f"{top_id}_dem.tif")
-                use_dem = os.path.exists(dem_path)
-                if use_dem:
-                    print(f"  DEM found: {dem_path}")
-                else:
-                    print(f"  No GeoTIFF DEM at {dem_path} — will use RGB footprint PCA")
 
-                # Register LiDAR to PLY world via DEM-based PCA (wall-height alignment)
-                if use_dem:
-                  try:
-                    transform, debug_reg, reg_note, dem_debug = \
-                        auto_snip_lidar.register_lidar_to_ply_world_dem(
-                            lidar["lidar_pts"], lidar["lidar_xz_bbox"],
-                            dem_path, render_world_bbox,
-                            lidar["lidar_render"], render_img,
+                try:
+                    transform, debug_reg, reg_note, reg_debug = \
+                        auto_snip_lidar.register_lidar_to_ply_world_chamfer(
+                            lidar["lidar_render"], lidar["lidar_xz_bbox"],
+                            render_img, render_world_bbox,
                             lidar["xz_polygon"],
                         )
-                  except RuntimeError as e:
-                    print(f"  DEM registration failed: {e} — falling back to RGB footprint PCA")
-                    use_dem = False
-
-                if not use_dem:
+                except RuntimeError as e:
+                    print(f"  Chamfer failed: {e} — falling back to RGB PCA")
                     try:
-                        transform, debug_reg, reg_note, pca_debug = \
+                        transform, debug_reg, reg_note, reg_debug = \
                             auto_snip_lidar.register_lidar_to_ply_world(
                                 lidar["lidar_render"], lidar["lidar_xz_bbox"],
                                 render_img, render_world_bbox,
                                 lidar["xz_polygon"],
                             )
-                        dem_debug = pca_debug
                     except RuntimeError as e2:
                         print(f"  Registration failed: {e2}")
                         continue
 
                 reg_path = os.path.join(output_dir, f"debug_SU{su_number}_registration.png")
                 cv2.imwrite(reg_path, debug_reg)
-                print(f"  Registration debug ({reg_note}): {reg_path}")
+                print(f"  Registration ({reg_note}): {reg_path}")
+                for key, img_arr in reg_debug.items():
+                    cv2.imwrite(
+                        os.path.join(output_dir, f"debug_SU{su_number}_{key}.png"), img_arr)
+                    print(f"  Saved: debug_SU{su_number}_{key}.png")
 
-                # Save DEM debug images if available
-                for key, img_arr in dem_debug.items():
-                    dem_dbg_path = os.path.join(output_dir, f"debug_SU{su_number}_{key}.png")
-                    cv2.imwrite(dem_dbg_path, img_arr)
-                    print(f"  Saved: {dem_dbg_path}")
-
-                # ------------------------------------------------------------------
-                # Also run edge-based registration unconditionally for comparison.
-                # Uses Canny edge detection + SIFT on edge images to match wall
-                # geometry across the two render modalities.
-                # ------------------------------------------------------------------
-                print(f"  [Edge-SIFT] Running edge-based registration for comparison ...")
-                try:
-                    edge_transform, edge_debug_img, edge_note =                         auto_snip_lidar.register_lidar_to_ply_world_edges(
+                # --- experimental registration methods (compare side-by-side) ---
+                # Render-only methods: uniform (lidar_render, bbox, ply, bbox, poly) sig
+                _exp_methods = [
+                    ("phase_corr",    auto_snip_lidar.register_lidar_to_ply_world_phase_corr),
+                    ("prerot_akaze",  auto_snip_lidar.register_lidar_to_ply_world_prerot_akaze),
+                    ("annot_bndry",   auto_snip_lidar.register_lidar_to_ply_world_annot_boundary),
+                    ("dist_pca",      auto_snip_lidar.register_lidar_to_ply_world_dist_pca),
+                    ("chamfer",       auto_snip_lidar.register_lidar_to_ply_world_chamfer),
+                    ("mutual_info",   auto_snip_lidar.register_lidar_to_ply_world_mutual_info),
+                ]
+                for _mname, _mfn in _exp_methods:
+                    print(f"  [Exp] Running {_mname} ...")
+                    try:
+                        _, _, _mnote, _mdbg = _mfn(
                             lidar["lidar_render"], lidar["lidar_xz_bbox"],
                             render_img, render_world_bbox,
                             lidar["xz_polygon"],
-                            su_number=su_number,
-                            output_dir=output_dir,
                         )
-                    edge_reg_path = os.path.join(
-                        output_dir, f"debug_SU{su_number}_registration_edges.png")
-                    cv2.imwrite(edge_reg_path, edge_debug_img)
-                    edge_yellow_world = edge_transform(lidar["xz_polygon"])
-                    print(f"  [Edge-SIFT] {edge_note}")
-                    print(f"  [Edge-SIFT] Yellow polygon world extent: "
-                          f"X=[{edge_yellow_world[:,0].min():.3f}, {edge_yellow_world[:,0].max():.3f}]  "
-                          f"Y=[{edge_yellow_world[:,1].min():.3f}, {edge_yellow_world[:,1].max():.3f}]")
-                    print(f"  [Edge-SIFT] Registration debug: {edge_reg_path}")
-                except RuntimeError as edge_err:
-                    print(f"  [Edge-SIFT] Failed: {edge_err}")
+                        for _key, _img in _mdbg.items():
+                            _p = os.path.join(output_dir,
+                                              f"debug_SU{su_number}_{_mname}_{_key}.png")
+                            cv2.imwrite(_p, _img)
+                        print(f"  [Exp:{_mname}] {_mnote}")
+                    except Exception as _merr:
+                        print(f"  [Exp:{_mname}] Failed: {_merr}")
+
+                # DEM-ridge method: needs lidar_pts + dem_path (separate signature)
+                if os.path.exists(dem_path):
+                    print(f"  [Exp] Running dem_ridge ...")
+                    try:
+                        _, _, _rnote, _rdbg = \
+                            auto_snip_lidar.register_lidar_to_ply_world_dem_ridge(
+                                lidar["lidar_pts"], lidar["lidar_xz_bbox"],
+                                dem_path, render_world_bbox,
+                                lidar["lidar_render"], render_img,
+                                lidar["xz_polygon"],
+                            )
+                        for _key, _img in _rdbg.items():
+                            _p = os.path.join(output_dir,
+                                              f"debug_SU{su_number}_dem_ridge_{_key}.png")
+                            cv2.imwrite(_p, _img)
+                        print(f"  [Exp:dem_ridge] {_rnote}")
+                    except Exception as _rerr:
+                        print(f"  [Exp:dem_ridge] Failed: {_rerr}")
 
                 yellow_world = transform(lidar["xz_polygon"])
 
