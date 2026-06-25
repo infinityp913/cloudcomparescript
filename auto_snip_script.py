@@ -428,9 +428,35 @@ if __name__ == "__main__":
 
                 # Save DEM debug images if available
                 for key, img_arr in dem_debug.items():
-                    dem_path = os.path.join(output_dir, f"debug_SU{su_number}_{key}.png")
-                    cv2.imwrite(dem_path, img_arr)
-                    print(f"  Saved: {dem_path}")
+                    dem_dbg_path = os.path.join(output_dir, f"debug_SU{su_number}_{key}.png")
+                    cv2.imwrite(dem_dbg_path, img_arr)
+                    print(f"  Saved: {dem_dbg_path}")
+
+                # ------------------------------------------------------------------
+                # Also run edge-based registration unconditionally for comparison.
+                # Uses Canny edge detection + SIFT on edge images to match wall
+                # geometry across the two render modalities.
+                # ------------------------------------------------------------------
+                print(f"  [Edge-SIFT] Running edge-based registration for comparison ...")
+                try:
+                    edge_transform, edge_debug_img, edge_note =                         auto_snip_lidar.register_lidar_to_ply_world_edges(
+                            lidar["lidar_render"], lidar["lidar_xz_bbox"],
+                            render_img, render_world_bbox,
+                            lidar["xz_polygon"],
+                            su_number=su_number,
+                            output_dir=output_dir,
+                        )
+                    edge_reg_path = os.path.join(
+                        output_dir, f"debug_SU{su_number}_registration_edges.png")
+                    cv2.imwrite(edge_reg_path, edge_debug_img)
+                    edge_yellow_world = edge_transform(lidar["xz_polygon"])
+                    print(f"  [Edge-SIFT] {edge_note}")
+                    print(f"  [Edge-SIFT] Yellow polygon world extent: "
+                          f"X=[{edge_yellow_world[:,0].min():.3f}, {edge_yellow_world[:,0].max():.3f}]  "
+                          f"Y=[{edge_yellow_world[:,1].min():.3f}, {edge_yellow_world[:,1].max():.3f}]")
+                    print(f"  [Edge-SIFT] Registration debug: {edge_reg_path}")
+                except RuntimeError as edge_err:
+                    print(f"  [Edge-SIFT] Failed: {edge_err}")
 
                 yellow_world = transform(lidar["xz_polygon"])
 
