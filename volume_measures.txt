@@ -121,3 +121,13 @@ SU22000_su1	112738614.08	1.8500442430934363	There might be a hole in the mesh.
 SU22044-22048	17186.51	0.0015381306018142254	There might be a hole in the mesh.
 SU22044-22048	8675.68	0.0015381306018142254	There might be a hole in the mesh.
 SU22000_su1	607385.82	1.8500442430934363	There might be a hole in the mesh.
+SU20001,_20002,_20003	31627.32	0.2462001955997559	There might be a hole in the mesh.
+SU20005	287505.58	0.46052795589094003	There might be a hole in the mesh.
+SU12001	85562.29	0.256887553108612	There might be a hole in the mesh.
+SU20001,_20002,_20003	438843.58	60.519416087288285	There might be a hole in the mesh.
+SU20001,_20002,_20003	701245.7	4.092548925972353	There might be a hole in the mesh.
+SU20001,_20002,_20003	925700.91	64.61672452169246	There might be a hole in the mesh.
+SU20001,_20002,_20003	64002.33	0.11172418278286114	There might be a hole in the mesh.
+SU20005	287505.58	0.46052795589094003	There might be a hole in the mesh.
+SU20001,_20002,_20003	701245.7	4.092548925972353	There might be a hole in the mesh.
+SU12001	344222.84	0.5148796816989494	There might be a hole in the mesh.

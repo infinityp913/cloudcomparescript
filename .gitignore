@@ -30,3 +30,8 @@ __pycache__/
 # Large data directories
 Data/Pgram_Job_*/
 Data/Final_Volumes/
+Data/example-*/
+Data/DEMs/
+
+# Claude Code internals
+.claude/
