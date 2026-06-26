@@ -1,7 +1,7 @@
 # TARP CloudCompare Script — Context for Agents
 
 > **New machine?** See [pre-req.md](pre-req.md) for environment setup before running anything.
-> Current active branch: `claude-vision-registration`. Changes uncommitted — see IMMEDIATE NEXT STEPS section.
+> Current active branch: `claude-vision-registration`. Latest commits: f5da8a7 (regex fallback), 68b06a7 (haiku no-chamfer best-of-3). All four sites validated and committed.
 
 ---
 
@@ -302,32 +302,31 @@ When a USDZ contains multiple yellow annotation clusters (e.g., SU21001 has 3 ro
 
 ## IMMEDIATE NEXT STEPS (for continuing agent)
 
-Branch: `claude-vision-registration`. All four sites have been validated and changes are **uncommitted**.
+Branch: `claude-vision-registration`. All four sites validated and committed (f5da8a7, 68b06a7).
 
-### 1. Commit current state
-
-All four sites are working:
+**Current per-site status (production, committed):**
 - 20002, 20003: AKAZE ✓
-- 20005: Claude Vision haiku no-chamfer ✓ (user confirmed)
-- 21001: Claude Vision haiku no-chamfer ✓ (10.75px when lucky) or PCA-Chamfer fallback (2.67px, slightly NW)
+- 20005: Claude Vision haiku no-chamfer, cx=689 cy=636, 20.73px ✓ (user confirmed correct)
+- 21001: Claude Vision haiku no-chamfer, cx=583 cy=706, 10.75px ✓ (~70% per run with best-of-3) OR PCA-Chamfer fallback (2.67px, slightly NW — acceptable)
 
-```bash
-git add auto_snip_lidar.py auto_snip_script.py CLAUDE.md
-git commit -m "Claude Vision: drop Chamfer, haiku best-of-3 + quality gate"
-```
+### What was tried to improve SU21001 (all reverted — broke other sites)
 
-### 2. Improve SU21001 reliability (optional)
+User noted 21001 is "shifted to the top right a bit." Tried in chronological order:
+1. **Sonnet-4-6 cascade** → composite-coordinate bias: cx=1152 for 20005 (far right, wrong) → reverted
+2. **System message "reasoning ≤10 words"** → changed haiku reasoning pattern; cx=424 for 20005 instead of 689 (wrong) → removed
+3. **Prompt "Reasoning ≤15 words"** → same cx=424 for 20005 → reverted
+4. **Multi-room corridor hint in prompt** → cy=551 for 21001 consistently (>100px → PCA-Chamfer fallback) → removed
+5. **temperature=0** → consistent cx=689 for 20005 ✓ BUT locked cy=386 for 21001 (haiku's modal answer is wrong) → reverted
 
-21001 relies on haiku getting the "corridor" interpretation on one of 3 attempts (~70% success rate). When it fails, it falls back to PCA-Chamfer (2.67px, "slightly northwest").
+**Golden state** (reverted to, currently committed): no system message, no short-reasoning limit, no multi-room hint, no temperature param. max_tokens=512. Haiku reasons freely about features; best-of-3 retry picks the correct one on ~70% of runs.
 
-Potential improvements:
-- **Increase retries**: Change `range(2)` to `range(4)` in the retry loop for n_polys > 1 (5 total attempts → ~87% success rate)
-- **Prompt hint for corridors**: If the PLY is taller than it is wide (corridor aspect ratio), add "This site is a long narrow corridor — the annotated rooms may span much of its length."
-- **Manual override**: Add `registration_override: {"cx": 583, "cy": 706}` to the JSON input to hardcode the correct PLY coords for this site.
+**Key lesson**: Haiku's spatial accuracy depends entirely on unrestricted long-form reasoning. ANY constraint on reasoning length (system message or prompt instruction) changes which features haiku identifies and breaks one or both sites.
 
-### 3. Run post-snip / volume pipeline
+**NOT YET TRIED**: `claude-opus-4-8` (untried model upgrade). Could test in experimental block only for 21001 without changing the cascade. Low priority — current result is acceptable.
 
-Once registration is confirmed, run `post_snip_script.py` on the newly cropped clouds to get volumes. Check for Poisson bubble artifacts (should be handled by density trimming at p10).
+### Next: Run post-snip / volume pipeline
+
+Run `post_snip_script.py` on the newly cropped clouds to get volumes. Check for Poisson bubble artifacts (should be handled by density trimming at p10).
 
 ---
 
