@@ -1262,11 +1262,16 @@ def _call_claude_for_region(
     ann_frac: float,
     n_polygons: int,
     model: str,
+    system_msg: str = None,
+    temperature: float = None,
+    prompt_suffix: str = "",
+    max_tokens: int = 512,
 ) -> dict:
     """Call Claude Vision API.
 
     Returns dict with keys: cx, cy, w, h (all in resized right-panel coords),
     and reasoning (string).
+    system_msg, temperature, prompt_suffix, max_tokens: experiment overrides.
     """
     import anthropic, base64, json as _json
 
@@ -1305,6 +1310,7 @@ def _call_claude_for_region(
         "Find the SAME feature in the RIGHT panel viewed from above. That feature's "
         "location in RIGHT is your best anchor for cx/cy. Only fall back to "
         "room-shape matching if no distinctive feature is visible.\n\n"
+        + (prompt_suffix + "\n\n" if prompt_suffix else "") +
         "TASK: Find the bounding box of the annotated region in the RIGHT panel.\n\n"
         "IMPORTANT: cx and cy are pixel coordinates within the RIGHT panel ONLY — "
         f"col 0 is the LEFT edge of the RIGHT panel, col {right_w-1} is its RIGHT "
@@ -1321,9 +1327,9 @@ def _call_claude_for_region(
     )
 
     client = anthropic.Anthropic(api_key=api_key)
-    resp = client.messages.create(
+    create_kwargs = dict(
         model=model,
-        max_tokens=512,
+        max_tokens=max_tokens,
         messages=[{
             "role": "user",
             "content": [
@@ -1334,6 +1340,11 @@ def _call_claude_for_region(
             ],
         }],
     )
+    if system_msg is not None:
+        create_kwargs["system"] = system_msg
+    if temperature is not None:
+        create_kwargs["temperature"] = temperature
+    resp = client.messages.create(**create_kwargs)
 
     raw = resp.content[0].text.strip()
     if raw.startswith("```"):
@@ -1392,6 +1403,8 @@ def register_lidar_to_ply_world_claude_vision(
     model: str = "claude-haiku-4-5-20251001",
     xz_polygons: list = None,
     use_chamfer: bool = True,
+    n_retries: int = 2,
+    claude_kwargs: dict = None,
 ) -> tuple:
     """Register LiDAR → PLY using Claude Vision for semantic localization.
 
@@ -1436,7 +1449,7 @@ def register_lidar_to_ply_world_claude_vision(
     # edge.  Coordinate system: cx/cy in Claude response are RIGHT-panel
     # relative (0..psW-1, 0..psH-1), NOT composite-relative.
     # ------------------------------------------------------------------
-    max_dim = 1024
+    max_dim = 2048
     l_scale = min(max_dim / lW, max_dim / lH, 1.0)
     p_scale = min(max_dim / pW, max_dim / pH, 1.0)
     lsW, lsH = int(lW * l_scale), int(lH * l_scale)
