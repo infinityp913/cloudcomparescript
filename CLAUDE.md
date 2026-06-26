@@ -140,8 +140,8 @@ Tried in the comparison block: phase-correlation on Canny edges, pre-rotated AKA
 
 ---
 
-### 10. Chamfer E-shape matching + PCA-locked rotation (**current best, in production**)
-`register_lidar_to_ply_world_chamfer()`
+### 10. PCA-Chamfer: PCA-locked rotation + Chamfer E-shape translation (**current best, in production**)
+`register_lidar_to_ply_world_pca_chamfer()`
 
 **Key insight:** Rotation is correct from PCA (-241.2° for SU22000_SU1); only translation is wrong. And the annotation E-polygon *is* the wall outline — its boundary should land on PLY wall edges.
 
@@ -176,20 +176,47 @@ Maximised MI between downsampled PLY and warped LiDAR gray images. MI=0.101 — 
 
 ---
 
+### 13. AKAZE-first cascade (multi-site validated, current production)
+
+**Key finding from multi-site testing:** Sites differ in whether the LiDAR scan has texture correspondence with the PLY photogrammetry.
+- **Sites with texture match** (e.g. SU20002/20003): AKAZE gets 33–36 RANSAC inliers. PreRotAKAZE is the correct primary method — it matches to the right place even in large multi-room scenes.
+- **Sites without texture match** (e.g. SU22000, SU20005, SU21001): LiDAR sees wall faces from inside; PLY sees tops from above. AKAZE gets 2–4 inliers (noise). PCA-Chamfer is the fallback.
+
+**Current cascade in `auto_snip_script.py`:**
+1. Run `register_lidar_to_ply_world_prerot_akaze` → check `reg_debug["inliers"]`
+2. If inliers ≥ 20 → use AKAZE result
+3. If inliers < 20 → fall back to `register_lidar_to_ply_world_pca_chamfer`
+4. If chamfer fails → fall back to `register_lidar_to_ply_world` (RGB PCA)
+
+**Why chamfer fails on large multi-room sites:** The PCA centroid of a large excavated area is in the middle of the whole scene, not near the specific room being annotated. Chamfer finds a low-cost local minimum matching the polygon to the wrong set of wall edges. AKAZE has no such problem because it matches features directly without needing a centroid prior.
+
+---
+
+### 14. Poisson density trimming (bubble fix, in production)
+
+After Poisson reconstruction (`density=True`), phantom boundary faces at the crop edge have low vertex support → low density scalar. `cc.filterBySFValue` accepts a `ccMesh` and filters by the associated vertex cloud's active SF.
+
+Trimming at p10 of the density distribution reduced SU22000_SU1 volume from ~19M cm³ (bubble-inflated) to ~607K cm³ (plausible).
+
+---
+
 ## Key invariants
 
 - `scale = 1.0` always. Both LiDAR and PLY are physical metres, same scene.
-- Rotation from RGB PCA is correct for this site (-241.2°). Lock it; don't re-search it.
+- Rotation from RGB PCA is correct for this site (-241.2° for SU22000). Lock it; don't re-search it.
 - Threshold is a **fixed fraction of the elevation range** (`pct/100.0`), NOT a data percentile.
 - `center_frac` parameters exist in the API but default to 1.0 (disabled). Only enable if you know the floor is geometrically central in both scans for your site.
 - PCA 180° ambiguity: always check both 0° and 180° rotations and pick the one where the yellow polygon falls inside the PLY render bounds.
+- Output dir is `Data/<json_id>/` (e.g. `Data/example-20002/`), NOT the PLY job folder. This prevents contamination when two JSONs share the same top job.
+- Multiple yellow polygons in a USDZ are all detected; crop uses the union; registration uses the largest.
+- Texture selection picks the **largest PNG by file size** from the USDZ (highest resolution).
 
 ## Potential future work
 
-- **Chamfer with fine rotation refinement:** Now that translation is right, a tight ±5° rotation refinement around the PCA value might squeeze out the last few pixels of error.
+- **Chamfer with fine rotation refinement:** A tight ±5° rotation refinement around the PCA value might squeeze out the last few pixels of error.
 - **DEM ridge with tighter GeoTIFF threshold:** Top 2% of ridge cells (not 10%) would give a sparser, more distinctive PLY ridge pattern that might help.
-- **Multi-scan validation:** Test on a different USDZ (different scanner orientation). If PCA rotation fails on a new scan, chamfer's free-rotation search can be re-enabled with a tighter angular range (±30° around PCA) rather than ±20°.
-- **Bubble removal in Poisson output:** Higher C2C percentile filter makes bubbles worse (removes too many boundary-constraining points). Better approach may be density-scalar trimming after Poisson, or filtering by normal Z component to remove near-vertical phantom faces.
+- **Multi-scan AKAZE threshold tuning:** The 20-inlier threshold has been validated on 5 sites. May need adjustment for sites with unusual scan geometry.
+- **Per-polygon volumes:** When a USDZ contains multiple yellow regions, currently they're combined into one crop. Could process each separately for per-sub-unit volumes.
 
 ## Debug images written per annotation
 

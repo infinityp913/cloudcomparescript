@@ -83,31 +83,21 @@ def _yellow_mask_bgr(bgr_pixels: np.ndarray) -> np.ndarray:
     )
 
 
-def _yellow_xz_polygon(
+def _yellow_xz_polygons(
     xz_pts: np.ndarray,
     cell_size: float = 0.10,
     simplify_m: float = 0.20,
-) -> tuple:
+    min_area_frac: float = 0.10,
+) -> list:
     """
-    Rasterise yellow XZ centroids → binary grid → contour of the largest
-    connected cluster → simplified polygon in XZ world coords.
+    Rasterise yellow XZ centroids → binary grid → contours of ALL significant
+    connected clusters → simplified polygons in XZ world coords.
 
-    Replaces the old convex-hull approach: the contour follows the actual
-    painted boundary including concavities, so the snip region is much tighter.
-
-    Args:
-        xz_pts:     (N, 2) XZ centroid coords of yellow faces
-        cell_size:  grid resolution in metres (default 10 cm).
-                    Smaller = finer contour detail.
-        simplify_m: polygon simplification tolerance in metres (default 20 cm).
-                    Reduces pixel-grid stairstep noise while preserving shape.
-
-    Returns:
-        polygon_xz:   (M, 2) float array — contour polygon in XZ world coords
-        filtered_pts: (K, 2) float array — centroids belonging to largest cluster
+    All clusters with area ≥ min_area_frac * largest_cluster_area are kept.
+    Returns a list of (polygon_xz, cluster_pts) tuples, sorted largest first.
     """
     if len(xz_pts) == 0:
-        return xz_pts, xz_pts
+        return []
 
     x0, z0 = float(xz_pts[:, 0].min()), float(xz_pts[:, 1].min())
     col = ((xz_pts[:, 0] - x0) / cell_size).astype(np.int32)
@@ -116,45 +106,54 @@ def _yellow_xz_polygon(
 
     grid = np.zeros((H, W), dtype=np.uint8)
     grid[row, col] = 255
-    # Round stairstep corners from grid quantization before contouring
     grid = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(grid, connectivity=8)
     if n_labels < 2:
-        # Only background — fall back to convex hull of all points
         hull_idx = cv2.convexHull(xz_pts.astype(np.float32).reshape(-1, 1, 2),
                                   returnPoints=False)
-        return xz_pts[hull_idx.flatten()].astype(float), xz_pts
+        return [(xz_pts[hull_idx.flatten()].astype(float), xz_pts)]
 
-    largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    cluster_mask = (labels == largest).astype(np.uint8) * 255
+    foreground_stats = stats[1:]  # skip background label 0
+    max_area = foreground_stats[:, cv2.CC_STAT_AREA].max()
+    min_area = max_area * min_area_frac
 
-    keep = labels[row, col] == largest
-    filtered_pts = xz_pts[keep]
-    print(f"  Cluster filter: {keep.sum()} / {len(xz_pts)} yellow centroids in largest cluster")
-
-    # Extract outer contour of the cluster mask
-    contours, _ = cv2.findContours(cluster_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        hull_idx = cv2.convexHull(filtered_pts.astype(np.float32).reshape(-1, 1, 2),
-                                  returnPoints=False)
-        return filtered_pts[hull_idx.flatten()].astype(float), filtered_pts
-
-    cnt = max(contours, key=cv2.contourArea)
-
-    # Simplify: epsilon in grid pixels → metres / cell_size
+    # Sort clusters largest-first
+    order = np.argsort(foreground_stats[:, cv2.CC_STAT_AREA])[::-1]
     epsilon_px = simplify_m / cell_size
-    cnt_simplified = cv2.approxPolyDP(cnt, epsilon_px, closed=True)
 
-    # Convert pixel (col, row) back to XZ world coords
-    poly_col = cnt_simplified[:, 0, 0].astype(float)
-    poly_row = cnt_simplified[:, 0, 1].astype(float)
-    polygon_xz = np.stack([x0 + poly_col * cell_size,
-                           z0 + poly_row * cell_size], axis=1)
+    result = []
+    for idx in order:
+        label_id = idx + 1  # +1 because we skipped background
+        area = foreground_stats[idx, cv2.CC_STAT_AREA]
+        if area < min_area:
+            break
 
-    print(f"  Yellow contour: {len(polygon_xz)} vertices "
-          f"(cell={cell_size*100:.0f} cm, simplify={simplify_m*100:.0f} cm)")
-    return polygon_xz, filtered_pts
+        cluster_mask = (labels == label_id).astype(np.uint8) * 255
+        keep = labels[row, col] == label_id
+        cluster_pts = xz_pts[keep]
+
+        contours, _ = cv2.findContours(cluster_mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            hull_idx = cv2.convexHull(cluster_pts.astype(np.float32).reshape(-1, 1, 2),
+                                      returnPoints=False)
+            result.append((cluster_pts[hull_idx.flatten()].astype(float), cluster_pts))
+            continue
+
+        cnt = max(contours, key=cv2.contourArea)
+        cnt_simplified = cv2.approxPolyDP(cnt, epsilon_px, closed=True)
+        poly_col = cnt_simplified[:, 0, 0].astype(float)
+        poly_row = cnt_simplified[:, 0, 1].astype(float)
+        polygon_xz = np.stack([x0 + poly_col * cell_size,
+                               z0 + poly_row * cell_size], axis=1)
+        result.append((polygon_xz, cluster_pts))
+
+    print(f"  Yellow clusters: {len(result)} kept "
+          f"(≥{min_area_frac*100:.0f}% of largest, cell={cell_size*100:.0f} cm)")
+    for i, (poly, pts) in enumerate(result):
+        print(f"    Cluster {i+1}: {len(poly)} vertices, {len(pts)} centroids")
+    return result
 
 
 def _su_name_from_usdz(zf: zipfile.ZipFile) -> str:
@@ -182,8 +181,9 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
         resolution: metres per pixel for the top-down render
 
     Returns dict with keys:
-        xz_polygon:      (M, 2) float  contour polygon of yellow region in LiDAR XZ space
-        xz_pts:          (N, 2) float  all yellow face centroid XZ coords
+        xz_polygon:      (M, 2) float  contour polygon of largest yellow region (for registration)
+        xz_polygons:     list of (M, 2) arrays — one per detected yellow cluster (for crop union)
+        xz_pts:          (N, 2) float  all yellow face centroid XZ coords (all clusters)
         lidar_render:    (H, W, 3) uint8 BGR top-down render of the mesh
         lidar_xz_bbox:   (x0, z0, x1, z1) in LiDAR local coords
         lidar_pts:       (V, 3) float32 raw vertex positions (X, Y=up, Z) for DEM computation
@@ -193,7 +193,11 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
     with zipfile.ZipFile(usdz_path) as zf:
         su_name   = _su_name_from_usdz(zf)
         usdc_name = next(n for n in zf.namelist() if n.endswith('.usdc'))
-        tex_name  = next(n for n in zf.namelist() if 'color' in n.lower() and n.endswith('.png'))
+        # Pick highest-resolution colour texture (largest file size)
+        color_pngs = [n for n in zf.namelist() if 'color' in n.lower() and n.endswith('.png')]
+        if not color_pngs:
+            raise RuntimeError("No color PNG texture found in USDZ")
+        tex_name = max(color_pngs, key=lambda n: zf.getinfo(n).file_size)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zf.extractall(tmpdir)
@@ -244,10 +248,14 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
             yellow_3d      = face_centroids[yellow_mask]  # (M, 3)
             xz_pts         = yellow_3d[:, [0, 2]]         # (M, 2) horizontal
 
-            # Build tight contour polygon from yellow centroids.
-            # Rasterises to a 10 cm grid, keeps the largest connected cluster,
-            # extracts the outer boundary contour, and simplifies to 20 cm tolerance.
-            xz_polygon, xz_pts = _yellow_xz_polygon(xz_pts, cell_size=0.05, simplify_m=0.15)
+            # Build contour polygons from yellow centroids — all significant clusters.
+            clusters = _yellow_xz_polygons(xz_pts, cell_size=0.05, simplify_m=0.15)
+            if not clusters:
+                raise RuntimeError("No yellow polygon clusters found")
+            xz_polygons = [poly for poly, _ in clusters]
+            # Combine all cluster pts for bbox/render; largest cluster polygon for registration
+            xz_pts      = np.concatenate([pts for _, pts in clusters], axis=0)
+            xz_polygon  = xz_polygons[0]  # largest cluster — used for registration PCA
             print(f"  Yellow XZ extent: "
                   f"X=[{xz_pts[:,0].min():.2f}, {xz_pts[:,0].max():.2f}]  "
                   f"Z=[{xz_pts[:,1].min():.2f}, {xz_pts[:,1].max():.2f}]")
@@ -290,11 +298,12 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
             img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
             return {
-                "xz_polygon":    xz_polygon,
+                "xz_polygon":    xz_polygon,   # largest cluster — for registration
+                "xz_polygons":   xz_polygons, # all clusters — for crop union
                 "xz_pts":        xz_pts,
                 "lidar_render":  img,
                 "lidar_xz_bbox": (x0, z0, x1, z1),
-                "lidar_pts":     pts,          # (V, 3) float32, Y-up, for DEM registration
+                "lidar_pts":     pts,
                 "su_name":       su_name,
             }
 

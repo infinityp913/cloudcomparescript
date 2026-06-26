@@ -12,6 +12,7 @@ import auto_snip_lidar
 cc.initCC()
 
 json_filepath = sys.argv[1] if len(sys.argv) > 1 else "example-17000.json"
+json_id = os.path.splitext(os.path.basename(json_filepath))[0]  # e.g. "example-20002"
 
 with open(json_filepath, "r") as f:
     job_data = json.load(f)
@@ -250,16 +251,22 @@ def find_annotation_to_world_transform(
 # Point cloud cropping
 # ---------------------------------------------------------------------------
 
-def crop_cloud_by_polygon_2d(cloud, polygon_world: np.ndarray):
+def crop_cloud_by_polygon_2d(cloud, polygon_world):
     """
     Return a new cloud containing only points whose (x, y) fall inside
-    the 2D polygon (N, 2) in world coords.
+    any of the given 2D polygons in world coords.
+    polygon_world may be a single (N, 2) array or a list of (N, 2) arrays.
     Uses a scalar field + cc.filterBySFValue (idiomatic CloudComPy).
     """
     from matplotlib.path import Path
 
+    if isinstance(polygon_world, np.ndarray):
+        polygon_world = [polygon_world]
+
     coords = cloud.toNpArrayCopy()
-    mask = Path(polygon_world).contains_points(coords[:, :2])
+    mask = np.zeros(len(coords), dtype=bool)
+    for poly in polygon_world:
+        mask |= Path(poly).contains_points(coords[:, :2])
 
     if not mask.any():
         print(f"  Warning: polygon crop produced 0 points for '{cloud.getName()}'")
@@ -357,7 +364,8 @@ if __name__ == "__main__":
         # Render top-down image from the top cloud (shared across all SUs in this pair)
         print("  Rendering top-down image from top cloud...")
         render_img, render_world_bbox = render_topdown_image(top_cloud, resolution=0.01)
-        output_dir = os.path.join(DATA_DIR, top_id)
+        output_dir = os.path.join(DATA_DIR, json_id)
+        os.makedirs(output_dir, exist_ok=True)
         render_path = os.path.join(output_dir, "debug_topdown_render.png")
         cv2.imwrite(render_path, render_img)
         print(f"  Render saved: {render_path}")
@@ -486,7 +494,11 @@ if __name__ == "__main__":
                     except Exception as _rerr:
                         print(f"  [Exp:dem_ridge] Failed: {_rerr}")
 
-                yellow_world = transform(lidar["xz_polygon"])
+                # Transform all polygon clusters; crop is the union of all of them
+                yellow_worlds = [transform(poly) for poly in lidar["xz_polygons"]]
+                yellow_world  = yellow_worlds[0]  # largest, for display/reference
+                if len(yellow_worlds) > 1:
+                    print(f"  Multi-polygon: {len(yellow_worlds)} regions detected")
 
             # ------------------------------------------------------------------
             # Branch B: PNG annotation (top-down photo with painted color lines)
@@ -515,7 +527,8 @@ if __name__ == "__main__":
                     continue
 
                 cv2.imwrite(os.path.join(output_dir, f"debug_SU{su_number}_annotation.png"), debug_ann)
-                yellow_world = transform(yellow_px)
+                yellow_world  = transform(yellow_px)
+                yellow_worlds = [yellow_world]
 
             else:
                 print(f"  Unsupported annotation format '{ext}', skipping.")
@@ -528,29 +541,36 @@ if __name__ == "__main__":
                   f"X=[{yellow_world[:,0].min():.3f}, {yellow_world[:,0].max():.3f}]  "
                   f"Y=[{yellow_world[:,1].min():.3f}, {yellow_world[:,1].max():.3f}]")
 
-            # Snip reference: full render (left) | dimmed render + highlighted crop (right)
+            # Snip reference: full render (left) | dimmed render + all polygons highlighted (right)
             rH, rW = render_img.shape[:2]
             rx0, ry0, rx1, ry1 = render_world_bbox
-            render_px = np.empty((len(yellow_world), 2), dtype=int)
-            render_px[:, 0] = np.clip(((yellow_world[:, 0] - rx0) / (rx1 - rx0) * rW).astype(int), 0, rW-1)
-            render_px[:, 1] = np.clip(((ry1 - yellow_world[:, 1]) / (ry1 - ry0) * rH).astype(int), 0, rH-1)
 
-            su_mask = np.zeros((rH, rW), dtype=np.uint8)
-            cv2.fillPoly(su_mask, [render_px.reshape(-1, 1, 2)], 255)
+            def _world_to_render_px(yw):
+                px = np.empty((len(yw), 2), dtype=int)
+                px[:, 0] = np.clip(((yw[:, 0] - rx0) / (rx1 - rx0) * rW).astype(int), 0, rW-1)
+                px[:, 1] = np.clip(((ry1 - yw[:, 1]) / (ry1 - ry0) * rH).astype(int), 0, rH-1)
+                return px
+
             highlight = render_img.copy()
+            su_mask = np.zeros((rH, rW), dtype=np.uint8)
+            for yw in yellow_worlds:
+                rpx = _world_to_render_px(yw)
+                cv2.fillPoly(su_mask, [rpx.reshape(-1, 1, 2)], 255)
             highlight[su_mask == 0] = (highlight[su_mask == 0].astype(float) * 0.35).astype(np.uint8)
-            cv2.polylines(highlight, [render_px.reshape(-1, 1, 2)], isClosed=True, color=(0, 255, 0), thickness=4)
+            for yw in yellow_worlds:
+                rpx = _world_to_render_px(yw)
+                cv2.polylines(highlight, [rpx.reshape(-1, 1, 2)], isClosed=True, color=(0, 255, 0), thickness=4)
 
             snip_ref = np.hstack([render_img, highlight])
             ref_path = os.path.join(output_dir, f"debug_SU{su_number}_snip_reference.png")
             cv2.imwrite(ref_path, snip_ref)
             print(f"  Snip reference saved: {ref_path}")
 
-            # Crop both clouds to the yellow polygon
+            # Crop both clouds to the union of all yellow polygons
             print("  Cropping top cloud...")
-            top_cropped = crop_cloud_by_polygon_2d(top_cloud, yellow_world)
+            top_cropped = crop_cloud_by_polygon_2d(top_cloud, yellow_worlds)
             print("  Cropping bottom cloud...")
-            bottom_cropped = crop_cloud_by_polygon_2d(bottom_cloud, yellow_world)
+            bottom_cropped = crop_cloud_by_polygon_2d(bottom_cloud, yellow_worlds)
 
             if top_cropped is None or bottom_cropped is None:
                 print(f"  Error: crop produced empty cloud for SU {su_number}, skipping.")

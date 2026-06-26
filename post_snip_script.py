@@ -11,6 +11,7 @@ from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project
 import glob
 
 json_filepath = sys.argv[1] if len(sys.argv) > 1 else "example.json"
+json_id = os.path.splitext(os.path.basename(json_filepath))[0]  # e.g. "example-20002"
 POINT_CLOUD_DIR = "Data"
 
 with open(json_filepath, "r") as f:
@@ -59,80 +60,49 @@ def get_su_number_from_filename(filename):
 
 def find_top_bottom_cloud_pairs(point_cloud_dir):
     """
-    Find pairs of top and bottom point clouds in the given directory.
-    Each pair consists of two point clouds with the same prefix (Pgram_Job_<job_number>_<comma separated list of SUs>_cleaned_su_) and a unique suffix (the su number).
-
-    The function searches for subdirectories that match the top names from the job data JSON file.
-    It then looks for files in those subdirectories that match the pattern *_cleaned_su_*.bin.
-    For each unique su number found, it pairs the top and bottom clouds based on their prefixes.
-
-    A HUGE assumption that the function makes: the top cloud will always have a lower job number than the bottom cloud.
-
-    The function ensures that the top cloud has a lower job number than the bottom cloud to avoid duplicates.
-    The pairs are returned as a list of tuples, where each tuple contains the full paths to the top and bottom clouds.
-
-    Args:
-        point_cloud_dir (str): The directory containing the point clouds.
-    Returns:
-        list: A list of tuples, where each tuple contains the full paths to the top and
+    Find top+bottom cloud pairs written by auto_snip into the per-JSON output folder.
+    The folder is named after the JSON file (e.g. Data/example-20002/).
+    Pairs are matched by SU number; the lower job number is treated as top.
     """
+    search_dir = os.path.join(point_cloud_dir, json_id)
+    if not os.path.isdir(search_dir):
+        print(f"Output dir not found: {search_dir}")
+        return []
+
+    bin_files = glob.glob(os.path.join(search_dir, "*_cleaned_su_*.bin"))
+    clouds = {}
+    for f in bin_files:
+        base = os.path.basename(f)
+        if "_cleaned_su_" not in base.lower() or not base.lower().endswith(".bin"):
+            continue
+        prefix = base.split("_cleaned_su_")[0]
+        su = base.split("_cleaned_su_")[1].replace(".bin", "")
+        if su.endswith("_top"):
+            su = su.replace("_top", "")
+            prefix = prefix + "_top"
+        clouds[(prefix, su)] = f
 
     pairs = []
-    for subdir in os.listdir(point_cloud_dir):
-        # Only consider subdirs that contain job["top"] for job in job_data
-        top_names_from_json = set(job["top"] for job in job_data if "top" in job)
-        for top_name_from_json in top_names_from_json:
-            if top_name_from_json.lower() in subdir.lower():
-                print(
-                    f"Found matching subdir for top name from json file {top_name_from_json}: {subdir} --- searching for cleaned bin files"
-                )
-                subdir_path = os.path.join(point_cloud_dir, subdir)
-                # Find all *_cleaned_su_*.bin files in the subdir
-                bin_files = glob.glob(os.path.join(subdir_path, "*_cleaned_su_*.bin"))
-                # Map from (prefix, su) to full path
-                clouds = {}
-                for f in bin_files:
-                    base = os.path.basename(f)
-                    # Extract prefix and su number
-                    if "_cleaned_su_" in base.lower() and base.lower().endswith(".bin"):
-                        prefix = base.split("_cleaned_su_")[0]
-                        su = base.split("_cleaned_su_")[1].replace(".bin", "")
-                        if su.endswith("_top"):
-                            su = su.replace("_top", "")
-                            prefix = prefix + "_top"
-                        clouds[(prefix, su)] = f
-                # For each su, if there are at least two clouds, consider all pairs
-                su_numbers = set(su for (_, su) in clouds.keys())
-                for su in su_numbers:
-                    prefixes = [prefix for (prefix, s) in clouds.keys() if s == su]
-                    if len(prefixes) >= 2:
-                        for i in range(len(prefixes)):
-                            for j in range(len(prefixes)):
-                                if i != j and prefixes[i].endswith("_top") and not prefixes[j].endswith("_top"):
-                                    top = prefixes[i]
-                                    bottom = prefixes[j]
-                                    pairs.append(
-                                        (clouds[(top, su)], clouds[(bottom, su)])
-                                    )
-                                elif i != j and not prefixes[i].endswith("_top") and prefixes[j].endswith("_top"):
-                                    top = prefixes[i]
-                                    bottom = prefixes[j]
-                                    pairs.append(
-                                        (clouds[(top, su)], clouds[(bottom, su)])
-                                    )
-                                else:
-                                    job_number_i = get_job_number_from_filename(prefixes[i])
-                                    job_number_j = get_job_number_from_filename(prefixes[j])
-                                    if i != j and job_number_i < job_number_j:
-                                        top = prefixes[i]
-                                        bottom = prefixes[j]
-                                        pairs.append(
-                                            (clouds[(top, su)], clouds[(bottom, su)])
-                                        )
-                    print(
-                    f"Found {len(pairs)} pairs of top and bottom clouds for {subdir}."
-                )
+    for su in set(su for (_, su) in clouds.keys()):
+        prefixes = [p for (p, s) in clouds.keys() if s == su]
+        if len(prefixes) < 2:
+            continue
+        for i in range(len(prefixes)):
+            for j in range(i + 1, len(prefixes)):
+                pi, pj = prefixes[i], prefixes[j]
+                if pi.endswith("_top") and not pj.endswith("_top"):
+                    pairs.append((clouds[(pi, su)], clouds[(pj, su)]))
+                elif pj.endswith("_top") and not pi.endswith("_top"):
+                    pairs.append((clouds[(pj, su)], clouds[(pi, su)]))
+                else:
+                    ni = get_job_number_from_filename(pi)
+                    nj = get_job_number_from_filename(pj)
+                    if ni is not None and nj is not None and ni < nj:
+                        pairs.append((clouds[(pi, su)], clouds[(pj, su)]))
+                    elif nj is not None and ni is not None and nj < ni:
+                        pairs.append((clouds[(pj, su)], clouds[(pi, su)]))
 
+    print(f"Found {len(pairs)} cloud pair(s) in {search_dir}")
     return pairs
 
 
