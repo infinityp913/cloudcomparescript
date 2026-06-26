@@ -24,6 +24,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Secrets
+.env
+*.env
+
 # Backup files
 *-backup.json
 

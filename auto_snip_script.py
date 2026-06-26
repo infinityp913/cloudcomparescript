@@ -394,6 +394,7 @@ if __name__ == "__main__":
                     lidar["lidar_render"], lidar["xz_polygon"],
                     lidar["lidar_xz_bbox"],
                     os.path.join(output_dir, f"debug_SU{su_number}_lidar_yellow.png"),
+                    xz_polygons=lidar.get("xz_polygons"),
                 )
 
                 # ------------------------------------------------------------------
@@ -425,6 +426,14 @@ if __name__ == "__main__":
                         transform = None
                 except RuntimeError as e:
                     print(f"  AKAZE failed: {e} — falling back to PCA-Chamfer")
+
+                if transform is None and os.environ.get("ANTHROPIC_API_KEY"):
+                    try:
+                        transform, debug_reg, reg_note, reg_debug = \
+                            auto_snip_lidar.register_lidar_to_ply_world_claude_vision(*_reg_args)
+                        print(f"  Claude Vision succeeded: {reg_note}")
+                    except RuntimeError as e:
+                        print(f"  Claude Vision failed: {e} — falling back to PCA-Chamfer")
 
                 if transform is None:
                     try:
@@ -459,6 +468,10 @@ if __name__ == "__main__":
                     ("pca_chamfer",   auto_snip_lidar.register_lidar_to_ply_world_pca_chamfer),
                     ("mutual_info",   auto_snip_lidar.register_lidar_to_ply_world_mutual_info),
                 ]
+                if os.environ.get("ANTHROPIC_API_KEY"):
+                    _exp_methods.append(
+                        ("claude_vision", auto_snip_lidar.register_lidar_to_ply_world_claude_vision)
+                    )
                 for _mname, _mfn in _exp_methods:
                     print(f"  [Exp] Running {_mname} ...")
                     try:

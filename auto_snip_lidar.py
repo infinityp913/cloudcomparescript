@@ -1242,6 +1242,238 @@ def register_lidar_to_ply_world_pca_chamfer(
     return transform_fn, debug_img, note, {"lidar_vs_result": lvr, "pca_axes": pca_axes_img}
 
 
+# ---------------------------------------------------------------------------
+# Claude Vision registration — semantic localization + Chamfer precision
+#
+# Sends a side-by-side composite (LiDAR annotation | PLY render) to the
+# Anthropic API.  Claude identifies approximately where the annotated room
+# sits in the PLY render and returns its pixel center.  That center seeds a
+# narrow Chamfer translation search (±120 px) instead of the PCA centroid,
+# which is unreliable on large multi-room sites.
+#
+# Requires: ANTHROPIC_API_KEY env var, `pip install anthropic`
+# ---------------------------------------------------------------------------
+
+def _call_claude_for_center(
+    composite_bgr: np.ndarray,
+    left_w: int,
+    right_w: int,
+    right_h: int,
+    model: str,
+) -> tuple:
+    """Call Claude Vision API and return (cx, cy) in the right panel (resized coords)."""
+    import anthropic, base64, json as _json
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+
+    ok, buf = cv2.imencode(".png", composite_bgr)
+    if not ok:
+        raise RuntimeError("PNG encode failed")
+    img_b64 = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+
+    prompt = (
+        "You are helping register two images of the same archaeological excavation.\n\n"
+        "The image you see has TWO panels side by side:\n"
+        f"  LEFT panel (roughly {left_w}px wide): iPhone LiDAR scan from INSIDE "
+        "the trench. The orange/yellow shaded polygon is the annotated sub-unit.\n"
+        f"  RIGHT panel ({right_w}×{right_h}px): Top-down photogrammetry of the "
+        "SAME site from above. No annotation is shown.\n\n"
+        "The two panels show the same physical walls/rooms from different viewpoints:\n"
+        "the LEFT sees wall faces from inside; the RIGHT sees wall tops from above.\n\n"
+        "Task: Find the approximate pixel center of the region in the RIGHT panel "
+        "that corresponds to the yellow/orange annotated area in the LEFT panel.\n"
+        "Think about the room layout — which room or area in the top-down view "
+        "matches the annotated space in the scan?\n\n"
+        "Return ONLY valid JSON, no other text:\n"
+        f'{{\"cx\": <int 0..{right_w-1}>, \"cy\": <int 0..{right_h-1}>}}'
+    )
+
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model=model,
+        max_tokens=128,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png",
+                            "data": img_b64}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+
+    raw = resp.content[0].text.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:]).rstrip("`").strip()
+
+    try:
+        data = _json.loads(raw)
+        cx = int(data["cx"])
+        cy = int(data["cy"])
+        return cx, cy
+    except Exception as e:
+        raise RuntimeError(f"Claude response parse failed: {e}  raw={raw[:200]!r}")
+
+
+def register_lidar_to_ply_world_claude_vision(
+    lidar_render: np.ndarray,
+    lidar_xz_bbox: tuple,
+    ply_render: np.ndarray,
+    ply_world_bbox: tuple,
+    xz_polygon: np.ndarray,
+    model: str = "claude-haiku-4-5-20251001",
+) -> tuple:
+    """Register LiDAR → PLY using Claude Vision for semantic localization.
+
+    Claude identifies which room/area in the PLY corresponds to the annotated
+    region in the LiDAR scan.  Its rough pixel-center estimate seeds a narrow
+    Chamfer translation search (±120 px), combining semantic understanding with
+    geometric precision.
+    """
+    lH, lW = lidar_render.shape[:2]
+    pH, pW = ply_render.shape[:2]
+    lx0, lz0, lx1, lz1 = lidar_xz_bbox
+    px0, py0, px1, py1 = ply_world_bbox
+
+    def _xz_to_li_px(xz):
+        return np.stack([(xz[:, 0] - lx0) / (lx1 - lx0) * lW,
+                         (xz[:, 1] - lz0) / (lz1 - lz0) * lH], axis=1)
+
+    yellow_lidar_px = _xz_to_li_px(xz_polygon)
+
+    # ------------------------------------------------------------------
+    # Build composite prompt image — both panels at max 768px long edge
+    # ------------------------------------------------------------------
+    max_dim = 768
+    l_scale = min(max_dim / lW, max_dim / lH, 1.0)
+    p_scale = min(max_dim / pW, max_dim / pH, 1.0)
+    lsW, lsH = int(lW * l_scale), int(lH * l_scale)
+    psW, psH = int(pW * p_scale), int(pH * p_scale)
+    l_small = cv2.resize(lidar_render, (lsW, lsH))
+    p_small = cv2.resize(ply_render,   (psW, psH))
+
+    # Draw yellow semi-transparent annotation fill on LiDAR panel
+    yellow_li_small = (yellow_lidar_px * l_scale).astype(np.int32)
+    overlay = l_small.copy()
+    cv2.fillPoly(overlay, [yellow_li_small], (0, 200, 255))
+    cv2.addWeighted(overlay, 0.4, l_small, 0.6, 0, l_small)
+    cv2.polylines(l_small, [yellow_li_small.reshape(-1, 1, 2)],
+                  isClosed=True, color=(0, 255, 255), thickness=3)
+
+    # Pad to same height, add divider
+    comp_h = max(lsH, psH)
+    def _pad(img, h):
+        if img.shape[0] >= h:
+            return img
+        return np.vstack([img, np.zeros((h - img.shape[0], img.shape[1], 3), np.uint8)])
+
+    divider = np.full((comp_h, 6, 3), 80, dtype=np.uint8)
+    composite = np.hstack([_pad(l_small, comp_h), divider, _pad(p_small, comp_h)])
+
+    # ------------------------------------------------------------------
+    # Ask Claude for the center of the corresponding region in PLY panel
+    # ------------------------------------------------------------------
+    print(f"  [ClaudeVision] Calling {model} ...")
+    cx_small, cy_small = _call_claude_for_center(composite, lsW, psW, psH, model)
+    # Scale back from resized PLY coords to original PLY px coords
+    cx_ply = cx_small / p_scale
+    cy_ply = cy_small / p_scale
+    print(f"  [ClaudeVision] Claude center in PLY: ({cx_ply:.0f}, {cy_ply:.0f})")
+
+    # ------------------------------------------------------------------
+    # Chamfer refinement seeded at Claude's center (±120 px search)
+    # ------------------------------------------------------------------
+    cx_li_center = float(yellow_lidar_px[:, 0].mean())
+    cy_li_center = float(yellow_lidar_px[:, 1].mean())
+
+    # PCA rotation (locked, same as pca_chamfer)
+    cx_li_pca, ang_li, _, _ = _pca_footprint(lidar_render)
+    cx_pl_pca, ang_pl, _, _ = _pca_footprint(ply_render)
+    rot0 = ang_pl - ang_li
+
+    # Pick 180° flip that keeps polygon inside PLY bounds
+    def _make_M3(rot, src_c, dst_c):
+        r = np.radians(rot); c, s = np.cos(r), np.sin(r)
+        tx = dst_c[0] - (c * src_c[0] - s * src_c[1])
+        ty = dst_c[1] - (s * src_c[0] + c * src_c[1])
+        return np.array([[c, -s, tx], [s, c, ty], [0, 0, 1]], dtype=np.float64)
+
+    def _apply(M3, pts):
+        h = np.column_stack([pts, np.ones(len(pts))])
+        return (M3 @ h.T).T[:, :2]
+
+    src_li = np.array([cx_li_center, cy_li_center])
+    dst_claude = np.array([cx_ply, cy_ply])
+
+    fixed_rot = rot0
+    for rot_candidate in [rot0, rot0 + 180]:
+        M_test = _make_M3(rot_candidate, src_li, dst_claude)
+        pts_test = _apply(M_test, yellow_lidar_px)
+        margin = 0.2
+        if (pts_test[:, 0].min() > -pW * margin and pts_test[:, 0].max() < pW * (1 + margin) and
+                pts_test[:, 1].min() > -pH * margin and pts_test[:, 1].max() < pH * (1 + margin)):
+            fixed_rot = rot_candidate
+            break
+
+    # Build edge distance transform
+    ply_gray  = cv2.cvtColor(ply_render, cv2.COLOR_BGR2GRAY)
+    ply_edges = cv2.Canny(ply_gray, 30, 120)
+    ply_edges = cv2.dilate(ply_edges, np.ones((3, 3), np.uint8))
+    dt = cv2.distanceTransform(255 - ply_edges, cv2.DIST_L2, 5).astype(np.float32)
+    PENALTY = float(dt.max()) * 2.0
+
+    poly_pts = _densify_polygon(yellow_lidar_px, step=3.0)
+    homog = np.column_stack([poly_pts, np.ones(len(poly_pts))])
+
+    def cost_fn(M3):
+        pp = (M3 @ homog.T).T[:, :2]
+        xs = np.round(pp[:, 0]).astype(np.int32)
+        ys = np.round(pp[:, 1]).astype(np.int32)
+        inb = (xs >= 0) & (xs < pW) & (ys >= 0) & (ys < pH)
+        if inb.sum() < 0.3 * len(pp):
+            return PENALTY
+        vals = np.full(len(pp), PENALTY, dtype=np.float32)
+        vals[inb] = dt[ys[inb], xs[inb]]
+        return float(vals.mean())
+
+    best_M3, best_cost, best_rot = _search_pose(
+        cost_fn, src_li, dst_claude, fixed_rot,
+        both_flips=False,
+        coarse_rot=(0, 0, 1), fine_rot=(0, 0, 1),
+        coarse_trans=(-120, 120, 15), fine_trans=(-15, 15, 3),
+    )
+    note = f"ClaudeVision+Chamfer rot={best_rot:.1f}° meanDist={best_cost:.2f}px"
+    print(f"  [ClaudeVision] {note}")
+
+    # ------------------------------------------------------------------
+    # Build transform_fn and debug images
+    # ------------------------------------------------------------------
+    ply_px_r = _apply(best_M3, yellow_lidar_px).astype(np.int32)
+
+    def transform_fn(xz_pts):
+        pp = _apply(best_M3, _xz_to_li_px(xz_pts))
+        world = np.empty((len(pp), 2))
+        world[:, 0] = px0 + pp[:, 0] * (px1 - px0) / pW
+        world[:, 1] = py1 - pp[:, 1] * (py1 - py0) / pH
+        return world
+
+    debug_img = ply_render.copy()
+    cv2.polylines(debug_img, [ply_px_r.reshape(-1, 1, 2)], True, (0, 255, 0), 4)
+
+    lvr = _make_lidar_vs_result(lidar_render, yellow_lidar_px, ply_render, ply_px_r,
+                                f"PLY ({note})")
+
+    return transform_fn, debug_img, note, {
+        "lidar_vs_result": lvr,
+        "claude_prompt":   composite,
+    }
+
+
 # Method 6 ─────────────────────────────────────────────────────────────────
 def _mutual_information(a: np.ndarray, b: np.ndarray, mask: np.ndarray,
                         bins: int = 32) -> float:
@@ -2347,15 +2579,33 @@ def save_lidar_debug(
     xz_polygon: np.ndarray,
     lidar_xz_bbox: tuple,
     out_path: str,
+    xz_polygons: list = None,
 ) -> None:
-    """Save LiDAR top-down render with yellow polygon overlaid in green."""
+    """Save LiDAR top-down render with annotation polygons overlaid.
+
+    Largest polygon (xz_polygon, used for registration) drawn in green.
+    Secondary polygons from xz_polygons drawn in cyan so multi-polygon
+    detection is visually verifiable.
+    """
     lx0, lz0, lx1, lz1 = lidar_xz_bbox
     lH, lW = lidar_render.shape[:2]
-    px = ((xz_polygon[:, 0] - lx0) / (lx1 - lx0) * lW).astype(np.int32)
-    pz = ((xz_polygon[:, 1] - lz0) / (lz1 - lz0) * lH).astype(np.int32)
     debug = lidar_render.copy()
-    cv2.polylines(debug, [np.stack([px, pz], axis=1).reshape(-1, 1, 2)],
-                  isClosed=True, color=(0, 255, 0), thickness=4)
+
+    def _to_px(poly):
+        px = ((poly[:, 0] - lx0) / (lx1 - lx0) * lW).astype(np.int32)
+        pz = ((poly[:, 1] - lz0) / (lz1 - lz0) * lH).astype(np.int32)
+        return np.stack([px, pz], axis=1).reshape(-1, 1, 2)
+
+    # Secondary polygons in cyan first (drawn underneath)
+    if xz_polygons is not None:
+        for poly in xz_polygons:
+            if not np.array_equal(poly, xz_polygon):
+                cv2.polylines(debug, [_to_px(poly)], isClosed=True,
+                              color=(255, 255, 0), thickness=3)
+
+    # Largest (registration) polygon in green on top
+    cv2.polylines(debug, [_to_px(xz_polygon)], isClosed=True,
+                  color=(0, 255, 0), thickness=4)
     cv2.imwrite(out_path, debug)
     print(f"  Saved: {out_path}")
 
