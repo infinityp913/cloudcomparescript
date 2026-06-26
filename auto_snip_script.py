@@ -429,12 +429,26 @@ if __name__ == "__main__":
 
                 if transform is None and os.environ.get("ANTHROPIC_API_KEY"):
                     try:
+                        _xz_polys = lidar.get("xz_polygons") or []
+                        # Chamfer causes false local minima on both single- and
+                        # multi-polygon sites — wall edges are too densely similar.
+                        # Claude's semantic seed is more accurate; skip Chamfer entirely.
                         transform, debug_reg, reg_note, reg_debug = \
                             auto_snip_lidar.register_lidar_to_ply_world_claude_vision(
                                 *_reg_args,
-                                xz_polygons=lidar.get("xz_polygons"),
+                                xz_polygons=_xz_polys,
+                                model="claude-haiku-4-5-20251001",
+                                use_chamfer=False,
                             )
-                        print(f"  Claude Vision succeeded: {reg_note}")
+                        _cv_dist = reg_debug.get("meanDist", 0)
+                        if _cv_dist > 100:
+                            # Polygon outlines far from wall edges → bad placement.
+                            # Reject and let cascade fall through to PCA-Chamfer.
+                            print(f"  Claude Vision: meanDist={_cv_dist:.1f}px too high "
+                                  f"— falling back to PCA-Chamfer")
+                            transform = None
+                        else:
+                            print(f"  Claude Vision succeeded: {reg_note}")
                     except RuntimeError as e:
                         print(f"  Claude Vision failed: {e} — falling back to PCA-Chamfer")
 
@@ -475,11 +489,16 @@ if __name__ == "__main__":
                     _exp_methods.append(
                         ("claude_vision", auto_snip_lidar.register_lidar_to_ply_world_claude_vision)
                     )
+                    _exp_methods.append(
+                        ("claude_vision_nochamfer", auto_snip_lidar.register_lidar_to_ply_world_claude_vision)
+                    )
                 for _mname, _mfn in _exp_methods:
                     print(f"  [Exp] Running {_mname} ...")
                     _extra = {}
-                    if _mname == "claude_vision":
+                    if _mname in ("claude_vision", "claude_vision_nochamfer"):
                         _extra["xz_polygons"] = lidar.get("xz_polygons")
+                    if _mname == "claude_vision_nochamfer":
+                        _extra["use_chamfer"] = False
                     try:
                         _, _, _mnote, _mdbg = _mfn(
                             lidar["lidar_render"], lidar["lidar_xz_bbox"],

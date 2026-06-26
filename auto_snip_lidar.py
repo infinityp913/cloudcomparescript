@@ -1286,34 +1286,44 @@ def _call_claude_for_region(
         "You are a spatial registration expert for archaeology.\n\n"
         "The image has TWO panels side by side, separated by a grey divider:\n"
         f"  LEFT ({left_w}px wide): iPhone LiDAR scan from INSIDE an excavation "
-        f"trench. The bright orange/yellow filled shape(s) show {poly_desc} "
-        "painted with yellow spray-paint on the trench floor.\n"
+        f"trench. The bright cyan-outlined shape(s) show {poly_desc} "
+        "painted with yellow spray-paint on the trench floor/walls.\n"
         f"  RIGHT ({right_w}×{right_h}px): Top-down photogrammetry of the SAME "
         "site — like a drone map looking straight down. No annotation shown.\n\n"
         "KEY FACTS:\n"
-        f"- Both images are the SAME physical scale (1 cm per pixel).\n"
-        f"- The annotated area fills about {ann_frac:.0%} of the LEFT panel area. "
-        "Therefore the matching region in RIGHT should cover roughly "
-        f"{ann_frac:.0%} of the RIGHT panel area too — it is NOT a tiny corner.\n"
-        "- LEFT shows wall FACES from inside; RIGHT shows wall TOPS from above.\n"
-        "- Match by: room shape, approximate size, enclosed floor area, any "
-        "internal features (stone blocks, pillars, doorways).\n\n"
-        "TASK: Find the bounding box of the region in the RIGHT panel that "
-        "corresponds to the annotated area in LEFT.\n\n"
-        "Return ONLY valid JSON (no markdown, no commentary):\n"
+        f"- The annotated region fills about {ann_frac:.0%} of the LEFT scan.\n"
+        "- CRITICAL: The RIGHT panel shows the ENTIRE archaeological site, which "
+        "is typically MUCH larger than the LiDAR scan footprint. The matching "
+        "region can be ANYWHERE in the RIGHT panel and may appear much smaller "
+        "than it does in LEFT. Do NOT assume any particular location or size.\n"
+        "- Scale is NOT guaranteed to match between panels — the PLY may cover "
+        "2×–10× more physical area than the LiDAR scan.\n"
+        "- LEFT shows wall FACES from inside the trench; RIGHT shows wall TOPS "
+        "from above.\n"
+        "- MATCHING STRATEGY: First look for distinctive internal features inside "
+        "the annotated area — square stone blocks, pillars, column bases, hearths. "
+        "Find the SAME feature in the RIGHT panel viewed from above. That feature's "
+        "location in RIGHT is your best anchor for cx/cy. Only fall back to "
+        "room-shape matching if no distinctive feature is visible.\n\n"
+        "TASK: Find the bounding box of the annotated region in the RIGHT panel.\n\n"
+        "IMPORTANT: cx and cy are pixel coordinates within the RIGHT panel ONLY — "
+        f"col 0 is the LEFT edge of the RIGHT panel, col {right_w-1} is its RIGHT "
+        "edge. Do NOT use coordinates from the full composite image.\n\n"
+        "Return ONLY valid JSON (no markdown, no commentary).\n"
+        "Put the numeric fields FIRST so you commit to coordinates before writing reasoning:\n"
         "{\n"
-        '  "reasoning": "<one sentence: which enclosed area you matched and why>",\n'
-        f'  "cx": <center column in RIGHT, integer 0..{right_w-1}>,\n'
-        f'  "cy": <center row in RIGHT, integer 0..{right_h-1}>,\n'
-        f'  "w": <estimated width of region in RIGHT, integer 1..{right_w}>,\n'
-        f'  "h": <estimated height of region in RIGHT, integer 1..{right_h}>\n'
+        f'  "cx": <center column in RIGHT panel, integer 0..{right_w-1}>,\n'
+        f'  "cy": <center row in RIGHT panel, integer 0..{right_h-1}>,\n'
+        f'  "w": <estimated width of annotated region in RIGHT panel, integer 1..{right_w}>,\n'
+        f'  "h": <estimated height of annotated region in RIGHT panel, integer 1..{right_h}>,\n'
+        '  "reasoning": "<which feature you matched and where it appears in RIGHT>"\n'
         "}"
     )
 
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
         model=model,
-        max_tokens=256,
+        max_tokens=512,
         messages=[{
             "role": "user",
             "content": [
@@ -1332,9 +1342,18 @@ def _call_claude_for_region(
 
     try:
         data = _json.loads(raw)
+        cx_raw = int(data["cx"])
+        cy_raw = int(data["cy"])
+        # Claude sometimes returns composite-image coordinates rather than
+        # right-panel-relative coordinates. If cx is beyond the right panel
+        # width, subtract the left panel + divider offset to correct it.
+        if cx_raw > right_w:
+            cx_raw -= (left_w + 8)
+        cx = int(np.clip(cx_raw, 0, right_w - 1))
+        cy = int(np.clip(cy_raw, 0, right_h - 1))
         return {
-            "cx":        int(data["cx"]),
-            "cy":        int(data["cy"]),
+            "cx":        cx,
+            "cy":        cy,
             "w":         int(data.get("w", right_w // 4)),
             "h":         int(data.get("h", right_h // 4)),
             "reasoning": str(data.get("reasoning", "")),
@@ -1351,6 +1370,7 @@ def register_lidar_to_ply_world_claude_vision(
     xz_polygon: np.ndarray,
     model: str = "claude-haiku-4-5-20251001",
     xz_polygons: list = None,
+    use_chamfer: bool = True,
 ) -> tuple:
     """Register LiDAR → PLY using Claude Vision for semantic localization.
 
@@ -1358,6 +1378,9 @@ def register_lidar_to_ply_world_claude_vision(
     region in the LiDAR scan, returning a bounding-box estimate.  That estimate
     seeds a Chamfer translation search whose window scales with the reported
     bbox size, combining semantic understanding with geometric precision.
+
+    use_chamfer=False: skip Chamfer and use Claude's bbox center directly.
+    Useful when the PLY has many similar wall edges causing false Chamfer minima.
 
     xz_polygons: all detected clusters (for drawing in debug images).
     """
@@ -1388,8 +1411,9 @@ def register_lidar_to_ply_world_claude_vision(
     ann_frac = max(0.02, min(0.95, ann_frac))
 
     # ------------------------------------------------------------------
-    # Build composite prompt image
-    # Max 1024px per panel long edge; enhance PLY contrast for visibility
+    # Build composite prompt image — both panels capped at 1024px long
+    # edge.  Coordinate system: cx/cy in Claude response are RIGHT-panel
+    # relative (0..psW-1, 0..psH-1), NOT composite-relative.
     # ------------------------------------------------------------------
     max_dim = 1024
     l_scale = min(max_dim / lW, max_dim / lH, 1.0)
@@ -1481,8 +1505,11 @@ def register_lidar_to_ply_world_claude_vision(
     dt        = cv2.distanceTransform(255 - ply_edges, cv2.DIST_L2, 5).astype(np.float32)
     PENALTY   = float(dt.max()) * 2.0
 
-    poly_pts = _densify_polygon(yellow_lidar_px, step=3.0)
-    homog    = np.column_stack([poly_pts, np.ones(len(poly_pts))])
+    # Use ALL polygons in Chamfer cost (multi-polygon scenes like corridors
+    # are much better constrained when every room outline contributes)
+    all_poly_pts = np.vstack([_densify_polygon(_xz_to_li_px(p), step=3.0)
+                              for p in xz_polygons])
+    homog = np.column_stack([all_poly_pts, np.ones(len(all_poly_pts))])
 
     def cost_fn(M3):
         pp  = (M3 @ homog.T).T[:, :2]
@@ -1495,20 +1522,57 @@ def register_lidar_to_ply_world_claude_vision(
         vals[inb] = dt[ys[inb], xs[inb]]
         return float(vals.mean())
 
-    # Chamfer search window: half of Claude's bbox estimate, clamped 80–300 px
-    search_r = int(np.clip(max(w_ply, h_ply) / 2, 80, 300))
-    step_c   = max(10, search_r // 12)
-    step_f   = max(3,  search_r // 40)
-    best_M3, best_cost, best_rot = _search_pose(
-        cost_fn, src_li, dst_claude, fixed_rot,
-        both_flips=False,
-        coarse_rot=(0, 0, 1),      fine_rot=(0, 0, 1),
-        coarse_trans=(-search_r, search_r, step_c),
-        fine_trans=(-step_c, step_c, step_f),
-    )
-    note = (f"ClaudeVision+Chamfer rot={best_rot:.1f}° meanDist={best_cost:.2f}px "
-            f"[{model.split('-')[1]}]")
-    print(f"  [ClaudeVision] {note}")
+    if not use_chamfer:
+        # Skip Chamfer — use Claude's bbox center directly.
+        # Best-of-3 retries: model is stochastic; lower meanDist = polygon outlines
+        # land closer to PLY wall edges → better placement. Multiple attempts let
+        # the best semantic match win even when the modal answer is wrong.
+        best_M3   = _make_M3(fixed_rot, src_li, dst_claude)
+        best_cost = cost_fn(best_M3)
+        best_rot  = fixed_rot
+        for _retry in range(2):
+            try:
+                _r     = _call_claude_for_region(
+                    composite, lsW, psW, psH, ann_frac, len(xz_polygons), model)
+                _dst   = np.array([_r["cx"] / p_scale, _r["cy"] / p_scale])
+                _rot   = fixed_rot
+                for _rc in [fixed_rot, fixed_rot + 180]:
+                    _Mt = _make_M3(_rc, src_li, _dst)
+                    _pt = _apply(_Mt, yellow_lidar_px)
+                    _mg = 0.25
+                    if (_pt[:, 0].min() > -pW * _mg and
+                            _pt[:, 0].max() < pW * (1 + _mg) and
+                            _pt[:, 1].min() > -pH * _mg and
+                            _pt[:, 1].max() < pH * (1 + _mg)):
+                        _rot = _rc; break
+                _M = _make_M3(_rot, src_li, _dst)
+                _c = cost_fn(_M)
+                print(f"  [ClaudeVision] retry {_retry+1}: PLY center="
+                      f"({_dst[0]:.0f},{_dst[1]:.0f}) meanDist={_c:.2f}px")
+                if _c < best_cost:
+                    best_cost, best_M3, best_rot = _c, _M, _rot
+            except RuntimeError:
+                pass
+        note = (f"ClaudeVision rot={best_rot:.1f}° meanDist={best_cost:.2f}px "
+                f"[{model.split('-')[1]}] (no-chamfer)")
+        print(f"  [ClaudeVision] {note}")
+    else:
+        # Chamfer search window: 10% of Claude's bbox estimate, clamped 30–120px.
+        # Narrow window keeps Chamfer close to Claude's semantic seed so it
+        # refines position without wandering to false local minima on wall edges.
+        search_r = int(np.clip(max(w_ply, h_ply) * 0.10, 30, 120))
+        step_c   = max(10, search_r // 12)
+        step_f   = max(3,  search_r // 40)
+        best_M3, best_cost, best_rot = _search_pose(
+            cost_fn, src_li, dst_claude, fixed_rot,
+            both_flips=False,
+            coarse_rot=(0, 0, 1),      fine_rot=(0, 0, 1),
+            coarse_trans=(-search_r, search_r, step_c),
+            fine_trans=(-step_c, step_c, step_f),
+        )
+        note = (f"ClaudeVision+Chamfer rot={best_rot:.1f}° meanDist={best_cost:.2f}px "
+                f"[{model.split('-')[1]}]")
+        print(f"  [ClaudeVision] {note}")
 
     # ------------------------------------------------------------------
     # Build transform_fn and debug images (all polygons)
@@ -1553,6 +1617,7 @@ def register_lidar_to_ply_world_claude_vision(
     return transform_fn, debug_img, note, {
         "lidar_vs_result": lvr,
         "claude_prompt":   composite,
+        "meanDist":        best_cost,
     }
 
 

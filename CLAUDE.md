@@ -1,5 +1,10 @@
 # TARP CloudCompare Script — Context for Agents
 
+> **New machine?** See [pre-req.md](pre-req.md) for environment setup before running anything.
+> Current active branch: `claude-vision-registration`. Changes uncommitted — see IMMEDIATE NEXT STEPS section.
+
+---
+
 ## What this repo does
 
 Automates the "snipping" step in the TARP archaeology volume pipeline:
@@ -185,8 +190,9 @@ Maximised MI between downsampled PLY and warped LiDAR gray images. MI=0.101 — 
 **Current cascade in `auto_snip_script.py`:**
 1. Run `register_lidar_to_ply_world_prerot_akaze` → check `reg_debug["inliers"]`
 2. If inliers ≥ 20 → use AKAZE result
-3. If inliers < 20 → fall back to `register_lidar_to_ply_world_pca_chamfer`
-4. If chamfer fails → fall back to `register_lidar_to_ply_world` (RGB PCA)
+3. If inliers < 20 AND `ANTHROPIC_API_KEY` set → fall back to `register_lidar_to_ply_world_claude_vision` (model=`claude-sonnet-4-6`)
+4. If Claude Vision fails → fall back to `register_lidar_to_ply_world_pca_chamfer`
+5. If chamfer fails → fall back to `register_lidar_to_ply_world` (RGB PCA)
 
 **Why chamfer fails on large multi-room sites:** The PCA centroid of a large excavated area is in the middle of the whole scene, not near the specific room being annotated. Chamfer finds a low-cost local minimum matching the polygon to the wrong set of wall edges. AKAZE has no such problem because it matches features directly without needing a centroid prior.
 
@@ -200,6 +206,82 @@ Trimming at p10 of the density distribution reduced SU22000_SU1 volume from ~19M
 
 ---
 
+### 15. Claude Vision — no-chamfer, best-of-3, quality gate (current production)
+
+**Branch:** `claude-vision-registration` (branched from `automate-snipping-fix-shift`)
+
+**Motivation:** PCA-Chamfer fails on hard sites (SU20005, SU21001) because the PCA centroid of the whole excavated area doesn't land near the specific sub-unit being annotated. Chamfer then finds false local minima on similar wall edges. Claude can semantically identify "which room in the aerial photo corresponds to what the iPhone scanned from inside" without texture correspondence.
+
+**Function:** `register_lidar_to_ply_world_claude_vision()` in `auto_snip_lidar.py`
+
+**Algorithm (current production):**
+1. Build a side-by-side composite: left=LiDAR render (annotation polygon outlined in cyan, no fill), right=PLY render (CLAHE contrast-enhanced, clipLimit=3.0, tileGridSize=(8,8)). Both panels capped at 1024px long edge.
+2. Compute `ann_frac` = fraction of LiDAR scan covered by annotation union mask. Pass to Claude as context.
+3. Call `claude-haiku-4-5-20251001`. Model returns JSON: `{"cx", "cy", "w", "h", "reasoning"}` — all in right-panel-relative pixel coords (0..psW-1, 0..psH-1). cx/cy are clamped after parsing.
+4. Scale cx_ply, cy_ply back to native PLY resolution using p_scale.
+5. Lock PCA rotation. Check 180° flip.
+6. **Skip Chamfer entirely** (`use_chamfer=False` always). Use Claude's bbox center directly as translation.
+7. **Best-of-3 retries**: make 2 additional API calls, compute PLY-edge meanDist for each, keep the result with lowest meanDist. Haiku is stochastic; retrying gives multiple chances to get the correct semantic placement.
+8. Return transform + `reg_debug["meanDist"]`.
+
+**Quality gate in cascade (auto_snip_script.py ~line 430):**
+- After Claude Vision returns, check `reg_debug["meanDist"]`.
+- If `meanDist > 100px` → reject and fall through to PCA-Chamfer. High meanDist means polygons are far from any PLY wall edge → clearly wrong placement.
+- If `meanDist ≤ 100px` → accept Claude Vision result.
+
+**Why no Chamfer:**
+Chamfer causes false local minima on BOTH single-polygon AND multi-polygon sites because the PLY has many similar wall edges everywhere. A low Chamfer cost does NOT imply correct registration — it only means the polygon boundary landed near SOME wall edge, not necessarily the correct one. Haiku's semantic placement (even at 20px meanDist) is more accurate than Chamfer's geometric refinement landing at the wrong wall.
+
+**Why haiku instead of sonnet:**
+Sonnet-4-6 truncated its JSON response at 512 tokens due to long reasoning, causing silent parse failures and cascade fallback to PCA-Chamfer. Haiku is faster, cheaper, and reliably produces valid JSON. Haiku's spatial accuracy is sufficient when Chamfer is not used.
+
+**Per-site status (validated):**
+
+| Site | Cascade method | MeanDist | Status |
+|------|----------------|----------|--------|
+| example-20002 (SU20002) | AKAZE, 36 inliers | — | ✅ CORRECT |
+| example-20003 (SU20003) | AKAZE, 33 inliers | — | ✅ CORRECT |
+| example-20005 (SU20005) | Claude Vision haiku no-chamfer | ~20–22px | ✅ CONFIRMED CORRECT by user |
+| example-21001 (SU12001) | Claude Vision haiku no-chamfer | ~10.75px (when lucky) or falls to PCA-Chamfer 2.67px | ⚠️ STOCHASTIC — see notes |
+
+**SU21001 behaviour:**
+- Haiku's modal answer for 21001 places polygons in the upper PLY corridor (meanDist ≈ 294px → rejected by quality gate).
+- On lucky runs (~1 in 3 first attempts), haiku sees "corridor-like structure, middle two-thirds" and gives cx=583, cy=706, meanDist=10.75px — this is CORRECT (all 3 rooms in the corridor at the right position).
+- Best-of-3 means each run gets 3 chances. Probability of at least one good attempt ≈ 70%.
+- If all 3 attempts fail quality gate → falls back to PCA-Chamfer (2.67px, slightly NW but visually reasonable).
+- Visual check: `debug_SU12001_lidar_vs_result.png` should show 3 polygons spanning the full corridor structure. If only one polygon visible or polygons are in the upper portion → it's the fallback PCA-Chamfer result.
+
+**Code locations:**
+- `_call_claude_for_region()` → auto_snip_lidar.py ~line 1257: API call, max_tokens=512, response parse, coordinate clamping
+- `register_lidar_to_ply_world_claude_vision()` → auto_snip_lidar.py ~line 1346. `use_chamfer=False` path has best-of-3 retry loop.
+- Cascade integration → auto_snip_script.py ~line 430: always `use_chamfer=False`, `model="claude-haiku-4-5-20251001"`, quality gate on meanDist > 100px.
+- Experimental block: runs claude_vision (haiku+Chamfer) and claude_vision_nochamfer (haiku, no-chamfer) for comparison.
+
+**Environment:**
+- `ANTHROPIC_API_KEY` must be set. Put in `.env` file (gitignored) at repo root.
+- `run.sh` auto-sources `.env` if present.
+- `.env.example` shows the format.
+
+**Estimated credit cost:** ~$0.001–0.003 per SU for haiku (3 API calls: cascade + 2 retries; ~512 output tokens each).
+
+**Debug images:**
+- `debug_<SU>_claude_prompt.png` — exact composite image sent to Claude (for debugging what the model saw)
+- `debug_<SU>_claude_vision_lidar_vs_result.png` — experimental claude_vision (Chamfer) result
+- `debug_<SU>_claude_vision_nochamfer_lidar_vs_result.png` — experimental no-chamfer result
+
+---
+
+### 16. Multi-polygon support (all clusters shown in debug, crop uses union)
+
+When a USDZ contains multiple yellow annotation clusters (e.g., SU21001 has 3 rooms), all clusters are detected and stored in `lidar["xz_polygons"]` (sorted largest first). The largest polygon is used as the registration anchor (`xz_polygon`). All polygons are:
+- Drawn in `lidar_yellow.png` debug (green=anchor, cyan=secondary)
+- Drawn in `lidar_vs_result.png` debug
+- Passed to `register_lidar_to_ply_world_claude_vision()` via `xz_polygons=` kwarg
+- Used in Chamfer cost (all polygon outlines, as of latest commit)
+- Used in crop: `transform_fn` applied to each polygon, crop = union of all transformed polygons
+
+---
+
 ## Key invariants
 
 - `scale = 1.0` always. Both LiDAR and PLY are physical metres, same scene.
@@ -210,6 +292,44 @@ Trimming at p10 of the density distribution reduced SU22000_SU1 volume from ~19M
 - Output dir is `Data/<json_id>/` (e.g. `Data/example-20002/`), NOT the PLY job folder. This prevents contamination when two JSONs share the same top job.
 - Multiple yellow polygons in a USDZ are all detected; crop uses the union; registration uses the largest.
 - Texture selection picks the **largest PNG by file size** from the USDZ (highest resolution).
+- Claude Vision cx/cy must be RIGHT-PANEL-RELATIVE (0..psW-1). They are clamped after parsing. If you see cx values > psW in logs, Claude gave composite-image coords — the clamp corrects it but the seed is degraded.
+- DO NOT fill the annotation polygon in the Claude prompt image. The natural yellow texture in the LiDAR render is what Claude needs; an opaque fill hides it and degrades matching.
+- **Chamfer is DISABLED for Claude Vision** (`use_chamfer=False` always). Chamfer finds false local minima on both single- and multi-polygon sites — low meanDist after Chamfer ≠ correct registration. Use Claude's semantic center directly.
+- **Quality gate**: if Claude Vision no-chamfer meanDist > 100px, the result is rejected (polygons far outside the PLY boundary) and cascade falls through to PCA-Chamfer.
+- **Best-of-3 retries**: `_call_claude_for_region()` is called 3 times in the no-chamfer path; result with lowest meanDist is kept. Haiku is stochastic — 3 tries gives ~70% chance of a good result for hard sites.
+- Claude Vision uses `claude-haiku-4-5-20251001` in the cascade. Sonnet-4-6 was dropped because it truncates its JSON at 512 tokens when reasoning is long, causing silent parse failures.
+- The PLY covers the ENTIRE archaeological site; the LiDAR scan covers just one sub-unit. Do NOT expect the annotation to fill the same fraction of the PLY as it fills of the LiDAR.
+
+## IMMEDIATE NEXT STEPS (for continuing agent)
+
+Branch: `claude-vision-registration`. All four sites have been validated and changes are **uncommitted**.
+
+### 1. Commit current state
+
+All four sites are working:
+- 20002, 20003: AKAZE ✓
+- 20005: Claude Vision haiku no-chamfer ✓ (user confirmed)
+- 21001: Claude Vision haiku no-chamfer ✓ (10.75px when lucky) or PCA-Chamfer fallback (2.67px, slightly NW)
+
+```bash
+git add auto_snip_lidar.py auto_snip_script.py CLAUDE.md
+git commit -m "Claude Vision: drop Chamfer, haiku best-of-3 + quality gate"
+```
+
+### 2. Improve SU21001 reliability (optional)
+
+21001 relies on haiku getting the "corridor" interpretation on one of 3 attempts (~70% success rate). When it fails, it falls back to PCA-Chamfer (2.67px, "slightly northwest").
+
+Potential improvements:
+- **Increase retries**: Change `range(2)` to `range(4)` in the retry loop for n_polys > 1 (5 total attempts → ~87% success rate)
+- **Prompt hint for corridors**: If the PLY is taller than it is wide (corridor aspect ratio), add "This site is a long narrow corridor — the annotated rooms may span much of its length."
+- **Manual override**: Add `registration_override: {"cx": 583, "cy": 706}` to the JSON input to hardcode the correct PLY coords for this site.
+
+### 3. Run post-snip / volume pipeline
+
+Once registration is confirmed, run `post_snip_script.py` on the newly cropped clouds to get volumes. Check for Poisson bubble artifacts (should be handled by density trimming at p10).
+
+---
 
 ## Potential future work
 
@@ -217,17 +337,20 @@ Trimming at p10 of the density distribution reduced SU22000_SU1 volume from ~19M
 - **DEM ridge with tighter GeoTIFF threshold:** Top 2% of ridge cells (not 10%) would give a sparser, more distinctive PLY ridge pattern that might help.
 - **Multi-scan AKAZE threshold tuning:** The 20-inlier threshold has been validated on 5 sites. May need adjustment for sites with unusual scan geometry.
 - **Per-polygon volumes:** When a USDZ contains multiple yellow regions, currently they're combined into one crop. Could process each separately for per-sub-unit volumes.
+- **Claude direct correspondences (no Chamfer):** Ask Claude to identify specific matched points (e.g., corners, stone block center) in both panels. Use those to compute the affine transform directly. Avoids false Chamfer local minima entirely.
 
 ## Debug images written per annotation
 
 | File | Contents |
 |------|----------|
-| `debug_<SU>_lidar_yellow.png` | LiDAR render with yellow annotation highlighted and green contour polygon |
-| `debug_<SU>_lidar_vs_result.png` | Side-by-side: LiDAR annotation (cyan) \| PLY with result polygon (green) |
+| `debug_<SU>_lidar_yellow.png` | LiDAR render with yellow annotation highlighted; cyan=primary, green=secondary polygons |
+| `debug_<SU>_lidar_vs_result.png` | Side-by-side: LiDAR (all polys in cyan/green) \| PLY with result polygons (green=primary, yellow=secondary) |
 | `debug_<SU>_pca_axes.png` | PCA axis overlays on both renders for rotation debugging |
 | `debug_<SU>_registration.png` | PLY top-down render with transformed annotation polygon in magenta |
-| `debug_<SU>_snip_reference.png` | PLY render (left) + darkened render with crop region in green (right) |
+| `debug_<SU>_snip_reference.png` | PLY render (left) + darkened render with ALL crop regions in green (right) |
+| `debug_<SU>_claude_prompt.png` | Exact composite image sent to Claude (LiDAR left, CLAHE PLY right, grey divider) |
 | `debug_<SU>_{method}_lidar_vs_result.png` | Same comparison for each experimental method |
+| `debug_<SU>_claude_vision_lidar_vs_result.png` | Experimental claude_vision result (haiku, for comparison with cascade sonnet) |
 
 ## Branch history
 
@@ -236,4 +359,5 @@ Trimming at p10 of the density distribution reduced SU22000_SU1 volume from ~19M
 | `main` | Original working scripts |
 | `lidar-annotation-strategy` | USDZ parsing, yellow face extraction, contour polygon |
 | `lidar-dem-registration` | DEM-based PCA registration experiments |
-| `automate-snipping-fix-shift` | All translation-fix experiments; chamfer matching (current production) |
+| `automate-snipping-fix-shift` | All translation-fix experiments; chamfer matching; AKAZE cascade |
+| `claude-vision-registration` | **CURRENT** — Claude Vision + Chamfer; multi-polygon support; sonnet-4-6 cascade |
