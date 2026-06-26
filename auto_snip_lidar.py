@@ -1340,8 +1340,29 @@ def _call_claude_for_region(
         lines = raw.split("\n")
         raw = "\n".join(lines[1:]).rstrip("`").strip()
 
+    def _extract(text):
+        """Parse JSON; fall back to regex if reasoning truncation cuts the closing brace."""
+        import re
+        try:
+            return _json.loads(text)
+        except Exception:
+            # Truncated reasoning leaves JSON unclosed. Extract numerics via regex.
+            m_cx = re.search(r'"cx"\s*:\s*(-?\d+)', text)
+            m_cy = re.search(r'"cy"\s*:\s*(-?\d+)', text)
+            if m_cx and m_cy:
+                return {
+                    "cx": int(m_cx.group(1)),
+                    "cy": int(m_cy.group(1)),
+                    "w":  int(re.search(r'"w"\s*:\s*(-?\d+)', text).group(1))
+                          if re.search(r'"w"\s*:\s*(-?\d+)', text) else right_w // 4,
+                    "h":  int(re.search(r'"h"\s*:\s*(-?\d+)', text).group(1))
+                          if re.search(r'"h"\s*:\s*(-?\d+)', text) else right_h // 4,
+                    "reasoning": "(truncated)",
+                }
+            raise
+
     try:
-        data = _json.loads(raw)
+        data = _extract(raw)
         cx_raw = int(data["cx"])
         cy_raw = int(data["cy"])
         # Claude sometimes returns composite-image coordinates rather than
