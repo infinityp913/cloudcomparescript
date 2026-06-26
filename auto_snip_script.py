@@ -430,7 +430,10 @@ if __name__ == "__main__":
                 if transform is None and os.environ.get("ANTHROPIC_API_KEY"):
                     try:
                         transform, debug_reg, reg_note, reg_debug = \
-                            auto_snip_lidar.register_lidar_to_ply_world_claude_vision(*_reg_args)
+                            auto_snip_lidar.register_lidar_to_ply_world_claude_vision(
+                                *_reg_args,
+                                xz_polygons=lidar.get("xz_polygons"),
+                            )
                         print(f"  Claude Vision succeeded: {reg_note}")
                     except RuntimeError as e:
                         print(f"  Claude Vision failed: {e} — falling back to PCA-Chamfer")
@@ -474,11 +477,15 @@ if __name__ == "__main__":
                     )
                 for _mname, _mfn in _exp_methods:
                     print(f"  [Exp] Running {_mname} ...")
+                    _extra = {}
+                    if _mname == "claude_vision":
+                        _extra["xz_polygons"] = lidar.get("xz_polygons")
                     try:
                         _, _, _mnote, _mdbg = _mfn(
                             lidar["lidar_render"], lidar["lidar_xz_bbox"],
                             render_img, render_world_bbox,
                             lidar["xz_polygon"],
+                            **_extra,
                         )
                         for _key, _img in _mdbg.items():
                             _p = os.path.join(output_dir,
