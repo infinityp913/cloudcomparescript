@@ -1405,15 +1405,13 @@ def register_lidar_to_ply_world_claude_vision(
     p_lab[:, :, 0] = clahe.apply(p_lab[:, :, 0])
     p_small = cv2.cvtColor(p_lab, cv2.COLOR_LAB2BGR)
 
-    # Draw all annotation polygons on LiDAR panel
+    # Draw annotation polygon outlines only — the yellow texture is already
+    # visible in the render; adding a fill distorts the colour Claude sees
     for i, py_small in enumerate([p * l_scale for p in all_yellow_li_px]):
         py_int = py_small.astype(np.int32)
-        overlay = l_small.copy()
-        cv2.fillPoly(overlay, [py_int], (0, 200, 255))
-        cv2.addWeighted(overlay, 0.45, l_small, 0.55, 0, l_small)
-        color = (0, 255, 255) if i == 0 else (255, 255, 0)
+        color = (0, 255, 255) if i == 0 else (255, 255, 0)  # cyan / yellow
         cv2.polylines(l_small, [py_int.reshape(-1, 1, 2)],
-                      isClosed=True, color=color, thickness=3)
+                      isClosed=True, color=color, thickness=4)
 
     # Pad to same height, add labelled divider
     comp_h = max(lsH, psH)
