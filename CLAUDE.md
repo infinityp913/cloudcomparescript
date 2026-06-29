@@ -9,9 +9,9 @@
 
 Automates the "snipping" step in the TARP archaeology volume pipeline:
 
-1. **pre_snip_script.py** — loads two PLY photogrammetry clouds (top + bottom of a stratigraphic unit), computes cloud-to-cloud distances, and saves the tagged clouds.
-2. **auto_snip_script.py** — given either a USDZ iPhone LiDAR scan (autosnip) or a hand-annotated ortho PNG (manual snip), locates the annotation in the PLY world frame and crops both clouds to that region.
-3. **post_snip_script.py** — merges the cropped clouds, runs Poisson reconstruction, and computes volumes.
+1. **pre_snip_script.py** — loads two PLY photogrammetry clouds (top + bottom of a stratigraphic unit), computes cloud-to-cloud distances, and saves the tagged clouds as `*_top_with_dist_for_<bottom_id>.bin` / `*_bottom_with_dist_for_<top_id>.bin` in `Data/<top_id>/`.
+2. **auto_snip_script.py** — given either a USDZ iPhone LiDAR scan (autosnip) or a hand-annotated ortho PNG (manual snip), locates the annotation in the PLY world frame and crops both clouds to that region. **Disabled in the dashboard** (unreliable); the lab snips manually in CloudCompare instead.
+3. **post_snip_script.py** — input.json-driven: resolves PLY stems from `top`/`bottom` pgram numbers, finds manually-snipped `*_snipped.bin` pairs in `Data/<top_id>/`, merges them, runs Poisson reconstruction, and computes volumes.
 
 ---
 
@@ -40,23 +40,25 @@ Each script can also be run directly:
 
 ## input.json format
 
+Written by the dashboard (`volume_runner._write_input_json`) before each script run:
+
 ```json
 [
   {
     "top": "786",
     "bottom": "787",
-    "annotations": ["../lidars/tarpf24477.usdz"]
+    "su": "20002"
   }
 ]
 ```
 
-- `top` / `bottom`: Pgram job numbers used to locate the `.ply` files under `~/Documents/TARP/ply/`.
-- `annotations`: list of annotation file paths. Mode is inferred from extension:
+- `top` / `bottom`: Pgram job numbers used to locate the `.ply` files under `~/Documents/TARP/ply/` and the `Data/<top_id>/` bin folder.
+- `su`: SU identifier from the kanban card (may be a range like `"22044-22048"`). Used by post_snip to name `SU_<su>_raw.obj`; also passed through for pre_snip (ignored) and auto_snip.
+- `annotations` (auto_snip only): list of annotation file paths. Mode is inferred from extension:
   - `.usdz` → **autosnip** (LiDAR scan with yellow-painted annotation)
   - `.png` → **manual snip** (annotated PLY ortho with black stroke outline)
-- For manual snip, add `"su": "20002"` at the job level if the SU number can't be parsed from the filename.
 
-Multiple annotations per job are supported. Multi-USDZ (multiple yellow clusters) is also supported — crop uses the union of all polygons.
+Multiple annotations per job are supported for auto_snip. Multi-USDZ (multiple yellow clusters) is also supported.
 
 ---
 
@@ -108,17 +110,31 @@ Evaluated across 4 sites (20002, 20003, 20005, 21001) using GT from annotated or
 
 ```
 Data/
-  Pgram_Job_<id>_<SU>/        # photogrammetry job folders (ignored by git, large)
-    *.bin                     # CloudCompare binary clouds
-    debug_*.png               # debug images written by auto_snip_script.py
+  <top_id>/                         # e.g. Pgram_Job_786_SU_20002_...
+    *_top_with_dist_for_<bot_id>.bin      # pre_snip output (top cloud + C2C distances)
+    *_bottom_with_dist_for_<top_id>.bin   # pre_snip output (bottom cloud + C2C distances)
+    *_top_with_dist_for_<bot_id>_snipped.bin    # manual crop saved by operator in CC
+    *_bottom_with_dist_for_<top_id>_snipped.bin # manual crop saved by operator in CC
+    SU_<su>_top_raw.obj               # top surface mesh (post_snip output)
+    debug_*.png                       # debug images from auto_snip_script.py
   DEMs/
-    Pgram_Job_<id>_<SU>_dem.tif   # GeoTIFF DEM for each photogrammetry job
-  Final_Volumes/              # output meshes (ignored by git)
-  eval/                       # eval_methods.py output composites
+    Pgram_Job_<id>_<SU>_dem.tif       # GeoTIFF DEM for each photogrammetry job
+  Final_Volumes/                      # output meshes (ignored by git)
+    SU_<su>_raw.obj                   # merged Poisson mesh for volume calculation
+  eval/                               # eval_methods.py output composites
 
 ../lidars/
-  *.usdz                      # iPhone LiDAR scans (ignored by git, large)
+  *.usdz                              # iPhone LiDAR scans (ignored by git, large)
 ```
+
+### Manual-snip file contract
+
+After Pre-Snip, the operator opens the pre-snip pair in CloudCompare via the "Open in CC" dashboard button, crops top and bottom, then **Save As** back into the same `Data/<top_id>/` folder with `_snipped` appended to each source name:
+
+- Top crop:    `<top_id>_top_with_dist_for_<bot_id>_snipped.bin`
+- Bottom crop: `<bot_id>_bottom_with_dist_for_<top_id>_snipped.bin`
+
+Post-snip finds these by globbing `*_top_with_dist_*_snipped.bin` and `*_bottom_with_dist_*_snipped.bin` in `Data/<top_id>/`. If multiple `_snipped` files exist (re-crops), the newest by mtime is used.
 
 ---
 

@@ -9,8 +9,8 @@ Part of the **[Tharros Archaeological Research Project (TARP)](https://air.ht.lu
 The pipeline processes paired top and bottom 3D models (PLY files) representing archaeological layers to compute the volume of material between them.
 
 1. **Pre-snip** (`pre_snip_script.py`): Loads PLY meshes, samples them to point clouds, computes bidirectional cloud-to-cloud (C2C) distances, and saves `.bin` files with distance scalar fields.
-2. **Auto-snip** (`auto_snip_script.py`): Locates the SU annotation in the PLY world frame and crops both clouds to that region. Supports two modes — **autosnip** (iPhone LiDAR USDZ) and **manual snip** (annotated ortho PNG).
-3. **Post-snip** (`post_snip_script.py`): Merges top and bottom cropped clouds, runs Poisson surface reconstruction, and computes 3D and 2.5D volumes.
+2. **Manual crop** (CloudCompare): The operator opens the pre-snip bin pair in CloudCompare, crops top and bottom to the SU boundary, and saves each result with a `_snipped` suffix in the same folder. Auto-snip (`auto_snip_script.py`) is available but disabled in the dashboard.
+3. **Post-snip** (`post_snip_script.py`): Reads `input.json`, resolves PLY stems, finds the manually-snipped `*_snipped.bin` pairs, merges them, runs Poisson surface reconstruction, and computes 3D and 2.5D volumes.
 
 ## Project Structure
 
@@ -111,13 +111,14 @@ Edit `input.json` for the SU you're processing:
   {
     "top": "786",
     "bottom": "787",
-    "annotations": ["../lidars/tarpf24477.usdz"]
+    "su": "20002"
   }
 ]
 ```
 
-- `"top"` / `"bottom"`: job numbers matching PLY filenames
-- `"annotations"`: list of annotation file paths — mode is inferred from extension:
+- `"top"` / `"bottom"`: Pgram job numbers matching PLY filenames and `Data/<top_id>/` folders.
+- `"su"`: SU identifier (may be a range like `"22044-22048"`). Used by post_snip to name output meshes. Written automatically by the dashboard; add manually when running scripts directly.
+- `"annotations"` (auto_snip only): list of annotation file paths — mode is inferred from extension:
   - `.usdz` → autosnip (iPhone LiDAR scan with yellow-painted annotation)
   - `.png` → manual snip (annotated PLY ortho with black stroke outline)
 
@@ -129,51 +130,16 @@ Edit `input.json` for the SU you're processing:
 
 Loads paired PLY meshes, samples them to point clouds, computes bidirectional C2C distances, and saves `*_top_with_dist_*.bin` and `*_bottom_with_dist_*.bin` in `Data/<top_job_folder>/`.
 
-### Step 3: Run Auto-snip
+### Step 3: Manually Crop in CloudCompare
 
-```bash
-./run.sh auto_snip_script.py input.json
-```
+After pre-snip, open the bin pair in CloudCompare (use the **Open in CC** button in the dashboard), crop both clouds to the SU boundary, and **Save As** each with a `_snipped` suffix in the same `Data/<top_id>/` folder:
 
-#### Mode A — Autosnip (USDZ)
+- Top crop:    `<top_id>_top_with_dist_for_<bot_id>_snipped.bin`
+- Bottom crop: `<bot_id>_bottom_with_dist_for_<top_id>_snipped.bin`
 
-For each USDZ annotation, the script:
+Post-snip picks these up automatically. If you re-crop, just Save As again — the newest file by modification time is used.
 
-1. Loads the iPhone LiDAR scan and extracts the yellow-painted annotation polygon.
-2. Renders a top-down orthographic image of the PLY top cloud (1 cm/px, RGB colors from photogrammetry).
-3. Runs 5 registration methods to align the LiDAR scan to the PLY world frame. `rgb_pca` is the default used for the crop; all 5 save side-by-side debug composites for comparison.
-4. Transforms the yellow polygon to PLY world coordinates.
-5. Crops both clouds (top and bottom) to that polygon.
-6. Saves `*_cleaned_su_<N>.bin` files and debug images in `Data/<json_id>/`.
-
-**Registration methods** (ranked by mean centroid error across 4 sites):
-
-| Method | Mean error | Notes |
-|--------|-----------|-------|
-| `rgb_pca` (**default**) | 1.30 m | PCA on RGB footprints — wins overall |
-| `dist_pca` | 1.34 m | Distance-weighted PCA variant |
-| `phase_corr` | 2.56 m | Phase correlation on Canny edges |
-| `prerot_akaze` | 2.63 m | AKAZE — fails when LiDAR ≠ PLY texture |
-| `pca_chamfer` | 2.86 m | PCA rotation + Chamfer translation |
-
-If `rgb_pca` gives the wrong result, inspect the other method debug images and re-run with the correct annotated ortho in manual snip mode.
-
-#### Mode B — Manual Snip (PNG)
-
-Draw the annotation as a **black outline** on the PLY top-down render (`debug_topdown_render.png`), then point `input.json` to that image:
-
-```json
-[
-  {
-    "top": "786",
-    "bottom": "787",
-    "su": "20002",
-    "annotations": ["orthos/ortho_20002_annotated.png"]
-  }
-]
-```
-
-The script detects black pixels, fills the enclosed region, and maps the polygon from ortho pixel space to PLY world coordinates.
+> **Auto-snip** (`auto_snip_script.py`) is still available for USDZ LiDAR or annotated ortho PNG workflows but is disabled in the dashboard. See `CLAUDE.md` for details.
 
 ### Step 4: Generate Final Volumes
 
@@ -181,7 +147,7 @@ The script detects black pixels, fills the enclosed region, and maps the polygon
 ./run.sh post_snip_script.py input.json
 ```
 
-For each matched `*_cleaned_su_<N>.bin` pair:
+For each matched `*_snipped.bin` pair in `Data/<top_id>/`:
 - Computes normals (inverts bottom cloud normals to point inward)
 - Merges top and bottom clouds
 - Runs Poisson surface reconstruction (depth=11) with density trimming at p10 (removes phantom boundary faces)
@@ -195,14 +161,14 @@ For each matched `*_cleaned_su_<N>.bin` pair:
 
 | File | Description |
 |------|-------------|
-| `Data/<json_id>/*_cleaned_su_<N>.bin` | Cropped point clouds for each SU |
-| `Data/Final_Volumes/SU_<N>_raw.obj` | Merged Poisson mesh for volume calculation |
-| `Data/<top_folder>/SU_<N>_top_raw.obj` | Top surface mesh |
+| `Data/<top_id>/*_top_with_dist_for_*_snipped.bin` | Manually-cropped top cloud (operator saves from CC) |
+| `Data/<top_id>/*_bottom_with_dist_for_*_snipped.bin` | Manually-cropped bottom cloud (operator saves from CC) |
+| `Data/Final_Volumes/SU_<su>_raw.obj` | Merged Poisson mesh for volume calculation |
+| `Data/<top_id>/SU_<su>_top_raw.obj` | Top surface mesh |
 | `volume_measures.txt` | Tab-separated: SU name, 3D volume (cm³), 2.5D volume (m³), warnings |
-| `Data/<json_id>/debug_topdown_render.png` | Top-down PLY render used for alignment |
-| `Data/<json_id>/debug_SU<N>_{method}_lidar_vs_result.png` | LiDAR vs PLY comparison per method |
-| `Data/<json_id>/debug_SU<N>_manual_annotation.png` | Ortho with extracted polygon (manual snip) |
-| `Data/<json_id>/debug_SU<N>_snip_reference.png` | Crop region overlay on PLY render |
+| `Data/<top_id>/debug_topdown_render.png` | Top-down PLY render used for alignment (auto_snip) |
+| `Data/<top_id>/debug_SU<N>_{method}_lidar_vs_result.png` | LiDAR vs PLY comparison per method (auto_snip) |
+| `Data/<top_id>/debug_SU<N>_snip_reference.png` | Crop region overlay on PLY render (auto_snip) |
 
 ---
 

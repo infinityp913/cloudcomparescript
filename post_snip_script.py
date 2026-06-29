@@ -1,4 +1,5 @@
 import json
+import re
 import cloudComPy as cc
 import cloudComPy.PoissonRecon
 import gc
@@ -7,99 +8,40 @@ import sys
 import math
 import numpy as np
 
-from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project
+from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project, find_mesh_by_pgram_job
 import glob
 import tarp_progress
 
 POINT_CLOUD_DIR = "Data"
 
 
-def get_job_number_from_filename(filename):
+
+def find_top_bottom_cloud_pairs(point_cloud_dir, top_id):
     """
-    Extract the job number from the filename.
-    The job number is expected to be in the format "Pgram_Job_<job_number>_SU...".
-
-    Args:
-        filename (str): The filename to extract the job number from.
-
-    Returns:
-        str: The extracted job number, or None if not found.
+    Find the manually-snipped bin pair for one SU in Data/<top_id>/.
+    Returns (top_path, bottom_path) or (None, None) if not found.
+    Picks newest by mtime when multiple candidates exist (re-crop case).
     """
-    parts = filename.lower().split("pgram_job_")
-    if len(parts) > 1:
-        job_part = parts[1].split("_")[0]
-        if job_part.isdigit():
-            return job_part
-    print(f"Warning: Job number not found in filename {filename}")
-    return None
+    folder = os.path.join(point_cloud_dir, top_id)
+    if not os.path.isdir(folder):
+        print(f"  Folder not found: {folder}")
+        return None, None
 
+    top_candidates = glob.glob(os.path.join(folder, "*_top_with_dist_*_snipped.bin"))
+    bot_candidates = glob.glob(os.path.join(folder, "*_bottom_with_dist_*_snipped.bin"))
 
-def get_su_number_from_filename(filename):
-    """
-    Extract the SU number from the filename.
-    The SU number is expected to be in the format "cleaned_su_<su_number>.bin".
+    if not top_candidates or not bot_candidates:
+        return None, None
 
-    Args:
-        filename (str): The filename to extract the SU number from.
+    top_path = max(top_candidates, key=os.path.getmtime)
+    bot_path = max(bot_candidates, key=os.path.getmtime)
 
-    Returns:
-        str: The extracted SU number, or None if not found.
-    """
-    parts = filename.lower().split("_cleaned_su_")
-    if len(parts) > 1:
-        su_part = parts[1].replace(".bin", "")
-        if su_part:
-            return su_part
-    print(f"Warning: SU number not found in filename {filename}")
-    return None
+    if len(top_candidates) > 1:
+        print(f"  Multiple _snipped top bins; using newest: {os.path.basename(top_path)}")
+    if len(bot_candidates) > 1:
+        print(f"  Multiple _snipped bottom bins; using newest: {os.path.basename(bot_path)}")
 
-
-def find_top_bottom_cloud_pairs(point_cloud_dir, json_id):
-    """
-    Find top+bottom cloud pairs written by auto_snip into the per-JSON output folder.
-    The folder is named after the JSON file (e.g. Data/example-20002/).
-    Pairs are matched by SU number; the lower job number is treated as top.
-    """
-    search_dir = os.path.join(point_cloud_dir, json_id)
-    if not os.path.isdir(search_dir):
-        print(f"Output dir not found: {search_dir}")
-        return []
-
-    bin_files = glob.glob(os.path.join(search_dir, "*_cleaned_su_*.bin"))
-    clouds = {}
-    for f in bin_files:
-        base = os.path.basename(f)
-        if "_cleaned_su_" not in base.lower() or not base.lower().endswith(".bin"):
-            continue
-        prefix = base.split("_cleaned_su_")[0]
-        su = base.split("_cleaned_su_")[1].replace(".bin", "")
-        if su.endswith("_top"):
-            su = su.replace("_top", "")
-            prefix = prefix + "_top"
-        clouds[(prefix, su)] = f
-
-    pairs = []
-    for su in set(su for (_, su) in clouds.keys()):
-        prefixes = [p for (p, s) in clouds.keys() if s == su]
-        if len(prefixes) < 2:
-            continue
-        for i in range(len(prefixes)):
-            for j in range(i + 1, len(prefixes)):
-                pi, pj = prefixes[i], prefixes[j]
-                if pi.endswith("_top") and not pj.endswith("_top"):
-                    pairs.append((clouds[(pi, su)], clouds[(pj, su)]))
-                elif pj.endswith("_top") and not pi.endswith("_top"):
-                    pairs.append((clouds[(pj, su)], clouds[(pi, su)]))
-                else:
-                    ni = get_job_number_from_filename(pi)
-                    nj = get_job_number_from_filename(pj)
-                    if ni is not None and nj is not None and ni < nj:
-                        pairs.append((clouds[(pi, su)], clouds[(pj, su)]))
-                    elif nj is not None and ni is not None and nj < ni:
-                        pairs.append((clouds[(pj, su)], clouds[(pi, su)]))
-
-    print(f"Found {len(pairs)} cloud pair(s) in {search_dir}")
-    return pairs
+    return top_path, bot_path
 
 
 def trim_mesh_by_density(mesh, density_min_pct=10):
@@ -188,12 +130,7 @@ def filter_by_c2c_distance(cloud, low_percentile=10):
     return filtered
 
 
-def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path):
-    top_base_name = os.path.basename(top_cloud_path).split("_cleaned_su_")[0]
-    bottom_base_name = os.path.basename(bottom_cloud_path).split("_cleaned_su_")[0]
-
-    su_number = get_su_number_from_filename(top_cloud_path)
-
+def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path, su_number, top_base_name, bottom_base_name):
     print(f"Loading point clouds for {top_base_name} and {bottom_base_name}...")
 
     # Load clouds with error checking
@@ -454,18 +391,18 @@ def save_merged_mesh_and_top_mesh(
     # gc.collect()
 
 
-def update_volume_measurements(volume_file, su_name, volume_3d, volume_25d, isWarning):
+def update_volume_measurements(volume_file, su_number, volume_3d, volume_25d, isWarning):
     notes = "There might be a hole in the mesh" if isWarning else "No issues detected"
-    new_line = f"SU{su_name}\t{volume_3d}\t{volume_25d}\t{notes}.\n"
+    new_line = f"SU{su_number}\t{volume_3d}\t{volume_25d}\t{notes}.\n"
 
-    # Read all lines and check if su_name exists
+    # Read all lines and check if su_number exists
     lines = []
     found = False
     if os.path.exists(volume_file):
         with open(volume_file, "r") as vol_file:
             lines = vol_file.readlines()
         for idx, line in enumerate(lines):
-            if line.split("\t", 1)[0] == su_name:
+            if line.split("\t", 1)[0] == su_number:
                 lines[idx] = new_line
                 found = True
                 break
@@ -479,58 +416,85 @@ def update_volume_measurements(volume_file, su_name, volume_3d, volume_25d, isWa
 
 def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
     """
-    Main entry point for post-snip processing.
-    Finds cropped cloud pairs from auto_snip output, runs Poisson reconstruction,
-    computes volumes, and saves meshes.
+    Main entry point for post-snip processing. Input-json-driven: reads top/bottom/su
+    from input.json, resolves the PLY stems via find_mesh_by_pgram_job, then globs
+    Data/<top_id>/ for manually-snipped *_snipped.bin pairs saved by the operator
+    after cropping in CloudCompare.
 
     Callable from any external Python program:
         import post_snip_script
         post_snip_script.run_postsnip_pipeline("input.json")
     """
-    json_id = os.path.splitext(os.path.basename(json_filepath))[0]
-    pairs = find_top_bottom_cloud_pairs(POINT_CLOUD_DIR, json_id)
-    if not pairs:
-        raise RuntimeError(
-            f"No top/bottom cloud pairs found in {POINT_CLOUD_DIR}. Auto-snip must run "
-            f"successfully before post-snip. Run from the dashboard, not directly."
-        )
+    with open(json_filepath) as f:
+        job_data = json.load(f)
 
-    total = len(pairs)
+    produced = 0
+    total = len(job_data)
     tarp_progress.report(0, total)
-    for i, (top_cloud_path, bottom_cloud_path) in enumerate(pairs):
-        top_base_name = os.path.basename(top_cloud_path).split("_cleaned_su_")[0]
-        su_number = top_cloud_path.split("_cleaned_su_")[1].replace(".bin", "")
+    for i, entry in enumerate(job_data):
+        top_pgram = entry.get("top", "")
+        bot_pgram = entry.get("bottom", "")
+        su = str(entry.get("su", ""))
+        if su and not re.match(r'^[\w\-]+$', su):
+            print(f"  Entry {i}: invalid su value {su!r} (must be alphanumeric/hyphen/underscore), skipping")
+            tarp_progress.report(i + 1, total, su)
+            continue
+
+        top_id = find_mesh_by_pgram_job(top_pgram)
+        bot_id = find_mesh_by_pgram_job(bot_pgram)
+
+        if not top_id or not bot_id:
+            print(f"  SU {su or '?'}: could not resolve PLY stem for top={top_pgram!r} or bottom={bot_pgram!r}, skipping")
+            tarp_progress.report(i + 1, total, su or '?')
+            continue
+
+        # Fallback: parse su from the top_id stem when the JSON entry lacks it
+        if not su:
+            parts = top_id.split("_SU_")
+            su = parts[1].split("_")[0] if len(parts) > 1 else ""
+
+        top_path, bot_path = find_top_bottom_cloud_pairs(POINT_CLOUD_DIR, top_id)
+        if not top_path or not bot_path:
+            print(
+                f"  SU {su}: no manually-snipped bins found in {POINT_CLOUD_DIR}/{top_id}/. "
+                f"Open the pre-snip bins in CC, crop top & bottom, and Save As with a "
+                f"`_snipped` suffix in the same folder."
+            )
+            tarp_progress.report(i + 1, total, su)
+            continue
 
         print(
-            f"\n=== Processing pair {i + 1}/{len(pairs)}: {su_number} ==="
-            f"\nTop Cloud: {top_cloud_path}\nBottom Cloud: {bottom_cloud_path}\n"
+            f"\n=== Processing pair {i + 1}/{len(job_data)}: SU {su} ==="
+            f"\nTop:    {top_path}\nBottom: {bot_path}\n"
         )
 
         try:
-            (
-                merged_cloud,
-                top_cloud,
-                bottom_cloud,
-                merged_mesh,
-                top_mesh,
-            ) = merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path)
-
-            if merged_cloud is not None and merged_mesh is not None:
-                project_name = f"{top_base_name}/{su_number}_post_snip.bin"
-                project_path = os.path.join(DATA_DIR, project_name)
+            result = merge_clouds_and_build_mesh(top_path, bot_path, su, top_id, bot_id)
+            if result and result[0] is not None and result[3] is not None:
+                merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh = result
+                project_path = os.path.join(DATA_DIR, top_id, f"{su}_post_snip.bin")
                 save_project(
                     [merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh],
                     project_path,
                 )
-                print(f"Successfully finished processing {su_number} and saved project at {project_path}")
+                print(f"Successfully finished processing SU {su} and saved project at {project_path}")
+                produced += 1
             else:
-                print(f"Failed to process {su_number}")
-            tarp_progress.report(i + 1, total, su_number)
+                print(f"  SU {su}: processing failed (merge or mesh returned None)")
+            tarp_progress.report(i + 1, total, su)
 
         except Exception as e:
-            print(f"Unexpected error processing {su_number}: {e}")
-            tarp_progress.report(i + 1, total, su_number)
+            print(f"  Unexpected error processing SU {su}: {e}")
+            tarp_progress.report(i + 1, total, su)
             continue
+
+    if produced == 0 and job_data:
+        raise RuntimeError(
+            "No manually-snipped clouds found for any SU in this run. "
+            "Open each SU's pre-snip bins (Open in CC), crop top & bottom, and Save As "
+            "with a `_snipped` suffix in the same `Data/<Pgram_Job_...>` folder before "
+            "running post-snip."
+        )
 
 
 if __name__ == "__main__":
