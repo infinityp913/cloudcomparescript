@@ -11,64 +11,19 @@ import auto_snip_lidar
 
 cc.initCC()
 
-json_filepath = sys.argv[1] if len(sys.argv) > 1 else "example-17000.json"
-json_id = os.path.splitext(os.path.basename(json_filepath))[0]  # e.g. "example-20002"
-
-with open(json_filepath, "r") as f:
-    job_data = json.load(f)
-
 
 # ---------------------------------------------------------------------------
-# Annotation image parsing
+# Annotation parsing
 # ---------------------------------------------------------------------------
 
-def parse_su_number(annotation_path: str) -> str:
+def parse_su_number(annotation_path: str) -> str | None:
+    """Return SU number from a filename containing '_SU_<number>', or None."""
     base = os.path.basename(annotation_path)
     parts = base.split("_")
     for i, part in enumerate(parts):
         if part.upper() == "SU" and i + 1 < len(parts):
             return parts[i + 1]
-    raise ValueError(f"Cannot parse SU number from filename: {base}")
-
-
-def extract_polygon_for_color(img_bgr: np.ndarray, color: str) -> np.ndarray | None:
-    """
-    Returns convex hull of the dominant connected cluster of the given annotation
-    color as (N, 2) array of (x_px, y_px), or None if not found.
-    Pure annotation colors have S > 150; muted terrain colors have S < 100.
-    """
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    color_ranges = {
-        "yellow": [(np.array([20, 150, 100]), np.array([40, 255, 255]))],
-        "red":    [(np.array([0,  150, 100]), np.array([10, 255, 255])),
-                   (np.array([165, 150, 100]), np.array([180, 255, 255]))],
-        "blue":   [(np.array([90, 150, 100]), np.array([130, 255, 255]))],
-    }
-    if color not in color_ranges:
-        raise ValueError(f"Unknown color: {color}")
-
-    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    for lo, hi in color_ranges[color]:
-        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
-
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if n_labels < 2:
-        return None
-
-    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    ys, xs = np.where(labels == largest_label)
-    if len(xs) < 5:
-        return None
-
-    points = np.column_stack([xs, ys]).astype(np.float32)
-    hull_idx = cv2.convexHull(points.reshape(-1, 1, 2), returnPoints=False)
-    hull = points[hull_idx.flatten()]
-    print(f"    {color}: {len(xs)} cluster px → hull {len(hull)} vertices "
-          f"(x={xs.min()}-{xs.max()}, y={ys.min()}-{ys.max()})")
-    return hull.astype(float)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +33,9 @@ def extract_polygon_for_color(img_bgr: np.ndarray, color: str) -> np.ndarray | N
 def render_topdown_image(cloud, resolution: float = 0.01) -> tuple:
     """
     Render a top-down XY projection of the cloud as a BGR image.
-    Returns (image_bgr, (x0, y0, x1, y1)) where the bbox is in world coords.
-    resolution: metres per pixel.
+    Returns (image_bgr, (x0, y0, x1, y1)) where bbox is in world coords.
     """
-    coords = cloud.toNpArrayCopy()  # (N, 3)
+    coords = cloud.toNpArrayCopy()
     x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
 
     x0, y0, x1, y1 = float(x.min()), float(y.min()), float(x.max()), float(y.max())
@@ -90,19 +44,16 @@ def render_topdown_image(cloud, resolution: float = 0.01) -> tuple:
     print(f"  Render size: {W}x{H} px at {resolution*100:.0f} cm/px")
 
     img = np.zeros((H, W, 3), dtype=np.uint8)
-
-    # Pixel positions (Y flipped: world Y up -> image row down)
     px = np.clip(((x - x0) / resolution).astype(int), 0, W - 1)
     py = np.clip((H - 1 - (y - y0) / resolution).astype(int), 0, H - 1)
 
-    # Sort by Z so topmost points overwrite lower ones
     order = np.argsort(z)
     px_s, py_s = px[order], py[order]
 
     if cloud.hasColors():
         try:
-            rgba = cloud.colorsToNpArrayCopy()  # (N, 4) uint8 RGBA
-            bgr = rgba[order, :3][:, ::-1]      # RGBA -> BGR
+            rgba = cloud.colorsToNpArrayCopy()
+            bgr = rgba[order, :3][:, ::-1]
             img[py_s, px_s] = bgr
             print("  Render: using RGB colors from cloud")
         except Exception as e:
@@ -114,137 +65,8 @@ def render_topdown_image(cloud, resolution: float = 0.01) -> tuple:
         img[py_s, px_s] = gray
         print("  Render: using height-map colors")
 
-    # Dilate to fill sparse gaps
     img = cv2.dilate(img, np.ones((7, 7), np.uint8))
-
     return img, (x0, y0, x1, y1)
-
-
-# ---------------------------------------------------------------------------
-# PCA-based similarity transform: annotation image -> rendered cloud image
-#
-# Feature matching (ORB/SIFT) fails because the annotation and render have
-# a large rotation difference and different visual characteristics (orthographic
-# render vs oblique photo). Instead we align the geometry:
-#   - PCA on the red+blue annotation outline pixels -> trench orientation & center
-#   - PCA on the non-black render pixels -> same for render footprint
-#   - Build similarity transform (rotation + scale + translation) from these.
-# ---------------------------------------------------------------------------
-
-def _get_rb_pixels(annotation_bgr: np.ndarray) -> np.ndarray:
-    """Return (N,2) (x,y) pixel coords of all red+blue annotation outline pixels."""
-    hsv = cv2.cvtColor(annotation_bgr, cv2.COLOR_BGR2HSV)
-    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    for lo, hi in [
-        (np.array([0,   150, 100]), np.array([10,  255, 255])),
-        (np.array([165, 150, 100]), np.array([180, 255, 255])),
-        (np.array([90,  150, 100]), np.array([130, 255, 255])),
-    ]:
-        mask |= cv2.inRange(hsv, lo, hi)
-    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
-    ys, xs = np.where(mask > 0)
-    return np.column_stack([xs, ys]).astype(float)
-
-
-def _get_render_pixels(render_bgr: np.ndarray) -> np.ndarray:
-    """Return (N,2) (x,y) pixel coords of all non-black render pixels."""
-    gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
-    ys, xs = np.where(gray > 10)
-    return np.column_stack([xs, ys]).astype(float)
-
-
-def _pca(pts: np.ndarray) -> tuple:
-    """PCA: returns (center_xy, main_angle_deg, std_main, std_perp)."""
-    center = pts.mean(axis=0)
-    cov = np.cov(pts.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)  # ascending order
-    main = eigenvectors[:, -1]
-    angle = np.degrees(np.arctan2(main[1], main[0]))
-    return center, angle, np.sqrt(eigenvalues[-1]), np.sqrt(eigenvalues[0])
-
-
-def find_annotation_to_world_transform(
-    annotation_bgr: np.ndarray,
-    render_bgr: np.ndarray,
-    render_world_bbox: tuple,
-    yellow_hull_px: np.ndarray,
-) -> tuple:
-    """
-    PCA-based similarity transform: annotation pixels -> world XY.
-    Aligns the red+blue trench outline (annotation) to the render footprint
-    using their principal axes (center, orientation, extent).
-    Tries both 180-degree orientations; picks the one where the yellow polygon
-    projects within the render image bounds.
-
-    Returns (transform_fn, debug_ann_img).
-    transform_fn: (N,2) annotation pixels -> (N,2) world XY.
-    """
-    ann_pts = _get_rb_pixels(annotation_bgr)
-    ren_pts = _get_render_pixels(render_bgr)
-
-    if len(ann_pts) < 10:
-        raise RuntimeError("PCA: too few red+blue pixels in annotation")
-    if len(ren_pts) < 10:
-        raise RuntimeError("PCA: render image appears empty")
-
-    cx_ann, ang_ann, std_main_ann, std_perp_ann = _pca(ann_pts)
-    cx_ren, ang_ren, std_main_ren, std_perp_ren = _pca(ren_pts)
-
-    scale = (std_main_ren / std_main_ann + std_perp_ren / std_perp_ann) / 2
-    rH, rW = render_bgr.shape[:2]
-    rx0, ry0, rx1, ry1 = render_world_bbox
-
-    print(f"  PCA ann:    center=({cx_ann[0]:.0f},{cx_ann[1]:.0f}) "
-          f"angle={ang_ann:.1f} main={std_main_ann:.0f}px perp={std_perp_ann:.0f}px")
-    print(f"  PCA render: center=({cx_ren[0]:.0f},{cx_ren[1]:.0f}) "
-          f"angle={ang_ren:.1f} main={std_main_ren:.0f}px perp={std_perp_ren:.0f}px")
-    print(f"  PCA scale: {scale:.4f}")
-
-    def _make_M(rot_deg: float) -> np.ndarray:
-        rot_rad = np.radians(rot_deg)
-        c, s = np.cos(rot_rad), np.sin(rot_rad)
-        tx = cx_ren[0] - scale * (c * cx_ann[0] - s * cx_ann[1])
-        ty = cx_ren[1] - scale * (s * cx_ann[0] + c * cx_ann[1])
-        return np.array([[scale * c, -scale * s, tx],
-                         [scale * s,  scale * c, ty],
-                         [0, 0, 1]])
-
-    def _apply_M(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
-        h = np.column_stack([pts, np.ones(len(pts))])
-        return (M @ h.T).T[:, :2]
-
-    def _within_render(rpts: np.ndarray, margin: float = 0.15) -> bool:
-        return (rpts[:, 0].min() > -rW * margin and
-                rpts[:, 0].max() <  rW * (1 + margin) and
-                rpts[:, 1].min() > -rH * margin and
-                rpts[:, 1].max() <  rH * (1 + margin))
-
-    rot_deg = ang_ren - ang_ann
-    chosen_M = None
-    for rotation in [rot_deg, rot_deg + 180]:
-        M = _make_M(rotation)
-        if _within_render(_apply_M(M, yellow_hull_px)):
-            print(f"  PCA rotation={rotation:.1f}deg -> yellow polygon within render bounds")
-            chosen_M = M
-            break
-
-    if chosen_M is None:
-        chosen_M = _make_M(rot_deg)
-        print(f"  PCA rotation={rot_deg:.1f}deg (fallback)")
-
-    def transform(annotation_pts: np.ndarray) -> np.ndarray:
-        render_pts = _apply_M(chosen_M, annotation_pts)
-        world = np.empty_like(render_pts, dtype=float)
-        world[:, 0] = rx0 + render_pts[:, 0] * (rx1 - rx0) / rW
-        world[:, 1] = ry1 - render_pts[:, 1] * (ry1 - ry0) / rH
-        return world
-
-    # Debug: annotation with yellow polygon drawn
-    debug = annotation_bgr.copy()
-    pts = yellow_hull_px.astype(np.int32).reshape(-1, 1, 2)
-    cv2.polylines(debug, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
-
-    return transform, debug
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +78,6 @@ def crop_cloud_by_polygon_2d(cloud, polygon_world):
     Return a new cloud containing only points whose (x, y) fall inside
     any of the given 2D polygons in world coords.
     polygon_world may be a single (N, 2) array or a list of (N, 2) arrays.
-    Uses a scalar field + cc.filterBySFValue (idiomatic CloudComPy).
     """
     from matplotlib.path import Path
 
@@ -290,7 +111,7 @@ def crop_cloud_by_polygon_2d(cloud, polygon_world):
 
 
 # ---------------------------------------------------------------------------
-# File discovery
+# File discovery + save
 # ---------------------------------------------------------------------------
 
 def find_presnip_bins(top_id: str, bottom_id: str) -> tuple[str, str]:
@@ -311,10 +132,6 @@ def find_presnip_bins(top_id: str, bottom_id: str) -> tuple[str, str]:
     return top_bin, bottom_bin
 
 
-# ---------------------------------------------------------------------------
-# Save cleaned cloud
-# ---------------------------------------------------------------------------
-
 def save_cleaned_cloud(cloud, output_dir: str, base_name: str, su_number: str, is_top: bool) -> str:
     suffix = "_top" if is_top else ""
     filename = f"{base_name}_cleaned_su_{su_number}{suffix}.bin"
@@ -326,15 +143,132 @@ def save_cleaned_cloud(cloud, output_dir: str, base_name: str, su_number: str, i
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Mode 1: Autosnip — LiDAR USDZ registration
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def run_autosnip(lidar: dict, render_img: np.ndarray, render_world_bbox: tuple,
+                 output_dir: str, su_number: str) -> tuple:
+    """
+    Register a LiDAR USDZ scan to the PLY world frame using 5 math methods.
+    rgb_pca is the default used for cropping; all 5 generate debug composites.
+    Returns (transform_fn, yellow_worlds) from rgb_pca, or (None, None) on failure.
+
+    API methods (Claude Vision, OpenRouter) are commented out but available
+    in auto_snip_lidar.py for future use.
+    """
+    METHODS = [
+        ("rgb_pca",      auto_snip_lidar.register_lidar_to_ply_world),        # DEFAULT
+        ("dist_pca",     auto_snip_lidar.register_lidar_to_ply_world_dist_pca),
+        ("phase_corr",   auto_snip_lidar.register_lidar_to_ply_world_phase_corr),
+        ("prerot_akaze", auto_snip_lidar.register_lidar_to_ply_world_prerot_akaze),
+        ("pca_chamfer",  auto_snip_lidar.register_lidar_to_ply_world_pca_chamfer),
+    ]
+    _args = (lidar["lidar_render"], lidar["lidar_xz_bbox"],
+             render_img, render_world_bbox, lidar["xz_polygon"])
+
+    default_transform = None
+    for name, fn in METHODS:
+        print(f"  [autosnip] Running {name} ...")
+        try:
+            transform_fn, _, note, reg_debug = fn(*_args)
+            # Save all numpy debug images from reg_debug with method name prefix
+            for key, val in reg_debug.items():
+                if isinstance(val, np.ndarray):
+                    dbg_path = os.path.join(output_dir,
+                                            f"debug_SU{su_number}_{name}_{key}.png")
+                    cv2.imwrite(dbg_path, val)
+            print(f"  [{name}] {note}")
+            if name == "rgb_pca":
+                default_transform = transform_fn
+        except Exception as e:
+            print(f"  [{name}] failed: {e}")
+
+    if default_transform is None:
+        return None, None
+
+    xz_polygons = lidar.get("xz_polygons") or [lidar["xz_polygon"]]
+    yellow_worlds = [default_transform(p) for p in xz_polygons]
+    return default_transform, yellow_worlds
+
+
+# ---------------------------------------------------------------------------
+# Mode 2: Manual Snip — annotated PLY ortho PNG
+# ---------------------------------------------------------------------------
+
+def run_manual_snip(annotated_path: str, render_img: np.ndarray,
+                    render_world_bbox: tuple) -> list:
+    """
+    Extract annotation polygon from a hand-annotated PLY ortho image.
+    The annotation should be drawn as black strokes over the ortho image.
+    Maps ortho pixel coords → PLY world coords via content-bbox normalisation.
+    Returns list of (N,2) float arrays in world (x,y) coords.
+    """
+    ann = cv2.imread(annotated_path)
+    if ann is None:
+        raise ValueError(f"Cannot read annotated image: {annotated_path}")
+
+    gray = cv2.cvtColor(ann, cv2.COLOR_BGR2GRAY)
+
+    # Detect black annotation pixels
+    black_mask = (gray < 50).astype(np.uint8) * 255
+    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_DILATE, np.ones((5, 5), np.uint8))
+
+    # Fill stroke outlines to solid regions
+    contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros(ann.shape[:2], np.uint8)
+    for c in contours:
+        if cv2.contourArea(c) > 2000:
+            cv2.fillPoly(filled, [c], 255)
+
+    contours2, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polys_px = [c.reshape(-1, 2).astype(float)
+                for c in contours2 if cv2.contourArea(c) > 5000]
+    if not polys_px:
+        raise ValueError(f"No annotation polygon found in {annotated_path}")
+
+    # Content bbox of ortho: non-black region spans the full PLY world extent
+    ys, xs = np.where(gray > 15)
+    if len(xs) == 0:
+        raise ValueError(f"Ortho image appears completely black: {annotated_path}")
+    ox0, oy0 = int(xs.min()), int(ys.min())
+    ox1, oy1 = int(xs.max()), int(ys.max())
+    ow, oh = ox1 - ox0, oy1 - oy0
+
+    wx0, wy0, wx1, wy1 = render_world_bbox
+    yellow_worlds = []
+    for pts in polys_px:
+        world = np.empty((len(pts), 2))
+        world[:, 0] = wx0 + (pts[:, 0] - ox0) / ow * (wx1 - wx0)
+        # Y flipped: image top → world max Y
+        world[:, 1] = wy1 - (pts[:, 1] - oy0) / oh * (wy1 - wy0)
+        yellow_worlds.append(world)
+    return yellow_worlds
+
+
+# ---------------------------------------------------------------------------
+# Pipeline entry point
+# ---------------------------------------------------------------------------
+
+def run_snip_pipeline(json_filepath: str = "input.json") -> None:
+    """
+    Main entry point. Reads input JSON and runs autosnip or manual snip per annotation.
+    Mode is inferred from file extension: .usdz → autosnip, .png → manual snip.
+
+    Callable from any external Python program:
+        import auto_snip_script
+        auto_snip_script.run_snip_pipeline("input.json")
+    """
+    json_id = os.path.splitext(os.path.basename(json_filepath))[0]
+
+    with open(json_filepath, "r") as f:
+        job_data = json.load(f)
+
     print("Starting auto-snip processing...")
 
     for job in job_data:
-        top_job    = job["top"]
-        bottom_job = job["bottom"]
+        top_job     = job["top"]
+        bottom_job  = job["bottom"]
         annotations = job.get("annotations", [])
 
         if not annotations:
@@ -361,21 +295,19 @@ if __name__ == "__main__":
         bottom_cloud = cc.loadPointCloud(bottom_bin)
         print(f"  Top: {top_cloud.size()} pts  Bottom: {bottom_cloud.size()} pts")
 
-        # Render top-down image from the top cloud (shared across all SUs in this pair)
         print("  Rendering top-down image from top cloud...")
         render_img, render_world_bbox = render_topdown_image(top_cloud, resolution=0.01)
         output_dir = os.path.join(DATA_DIR, json_id)
         os.makedirs(output_dir, exist_ok=True)
-        render_path = os.path.join(output_dir, "debug_topdown_render.png")
-        cv2.imwrite(render_path, render_img)
-        print(f"  Render saved: {render_path}")
+        cv2.imwrite(os.path.join(output_dir, "debug_topdown_render.png"), render_img)
+        print(f"  Render saved: {os.path.join(output_dir, 'debug_topdown_render.png')}")
 
         for annotation_path in annotations:
             ext = os.path.splitext(annotation_path)[1].lower()
             print(f"\n  Processing annotation: {annotation_path}")
 
             # ------------------------------------------------------------------
-            # Branch A: USDZ (LiDAR scan with physically-painted yellow annotation)
+            # AUTOSNIP: LiDAR USDZ with physically-painted yellow annotation
             # ------------------------------------------------------------------
             if ext == '.usdz':
                 try:
@@ -387,9 +319,6 @@ if __name__ == "__main__":
                 su_number = lidar["su_name"]
                 print(f"  SU name from USDZ: {su_number}")
 
-                # Save LiDAR debug images — use display render (inpainted + gamma)
-                # for visual inspection; raw render is kept in lidar["lidar_render"]
-                # for PCA computations.
                 _li_disp = lidar.get("lidar_render_display", lidar["lidar_render"])
                 cv2.imwrite(os.path.join(output_dir, "debug_lidar_render.png"), _li_disp)
                 auto_snip_lidar.save_lidar_debug(
@@ -399,179 +328,42 @@ if __name__ == "__main__":
                     xz_polygons=lidar.get("xz_polygons"),
                 )
 
-                # ------------------------------------------------------------------
-                # Registration cascade:
-                #   1. Hybrid: RGB PCA rotation + DEM floor centroid translation
-                #   2. Fallback: plain RGB footprint PCA
-                # ICP comparison always runs afterwards (result logged but not
-                # used for the crop so we can compare the two outputs).
-                # ------------------------------------------------------------------
-                dem_path = os.path.join(DATA_DIR, "DEMs", f"{top_id}_dem.tif")
-
-                # Registration strategy:
-                # 1. PreRotAKAZE — reliable when the scene has texture correspondence
-                #    (≥20 RANSAC inliers).  Fails gracefully when the modality gap is
-                #    too large (LiDAR interior walls vs PLY top-down view).
-                # 2. PCA-Chamfer — fallback when AKAZE can't find enough matches.
-                #    Locks PCA rotation and chamfer-searches translation only.
-                # 3. RGB PCA — last resort.
-                AKAZE_MIN_INLIERS = 20
-                _reg_args = (lidar["lidar_render"], lidar["lidar_xz_bbox"],
-                             render_img, render_world_bbox, lidar["xz_polygon"])
-                transform = debug_reg = reg_note = reg_debug = None
-                try:
-                    transform, debug_reg, reg_note, reg_debug = \
-                        auto_snip_lidar.register_lidar_to_ply_world_prerot_akaze(*_reg_args)
-                    if reg_debug.get("inliers", 0) < AKAZE_MIN_INLIERS:
-                        print(f"  AKAZE only {reg_debug['inliers']} inliers "
-                              f"(< {AKAZE_MIN_INLIERS}) — falling back to PCA-Chamfer")
-                        transform = None
-                except RuntimeError as e:
-                    print(f"  AKAZE failed: {e} — falling back to PCA-Chamfer")
-
-                if transform is None and os.environ.get("ANTHROPIC_API_KEY"):
-                    try:
-                        _xz_polys = lidar.get("xz_polygons") or []
-                        # Chamfer causes false local minima on both single- and
-                        # multi-polygon sites — wall edges are too densely similar.
-                        # Claude's semantic seed is more accurate; skip Chamfer entirely.
-                        transform, debug_reg, reg_note, reg_debug = \
-                            auto_snip_lidar.register_lidar_to_ply_world_claude_vision(
-                                *_reg_args,
-                                xz_polygons=_xz_polys,
-                                model="claude-haiku-4-5-20251001",
-                                use_chamfer=False,
-                                lidar_render_display=lidar.get("lidar_render_display"),
-                            )
-                        _cv_dist = reg_debug.get("meanDist", 0)
-                        if _cv_dist > 100:
-                            # Polygon outlines far from wall edges → bad placement.
-                            # Reject and let cascade fall through to PCA-Chamfer.
-                            print(f"  Claude Vision: meanDist={_cv_dist:.1f}px too high "
-                                  f"— falling back to PCA-Chamfer")
-                            transform = None
-                        else:
-                            print(f"  Claude Vision succeeded: {reg_note}")
-                    except RuntimeError as e:
-                        print(f"  Claude Vision failed: {e} — falling back to PCA-Chamfer")
-
-                if transform is None:
-                    try:
-                        transform, debug_reg, reg_note, reg_debug = \
-                            auto_snip_lidar.register_lidar_to_ply_world_pca_chamfer(*_reg_args)
-                    except RuntimeError as e:
-                        print(f"  PCA-Chamfer failed: {e} — falling back to RGB PCA")
-                        try:
-                            transform, debug_reg, reg_note, reg_debug = \
-                                auto_snip_lidar.register_lidar_to_ply_world(*_reg_args)
-                        except RuntimeError as e2:
-                            print(f"  Registration failed: {e2}")
-                            continue
-
-                reg_path = os.path.join(output_dir, f"debug_SU{su_number}_registration.png")
-                cv2.imwrite(reg_path, debug_reg)
-                print(f"  Registration ({reg_note}): {reg_path}")
-                for key, img_arr in reg_debug.items():
-                    if not isinstance(img_arr, np.ndarray):
-                        continue
-                    cv2.imwrite(
-                        os.path.join(output_dir, f"debug_SU{su_number}_{key}.png"), img_arr)
-                    print(f"  Saved: debug_SU{su_number}_{key}.png")
-
-                # --- experimental registration methods (compare side-by-side) ---
-                # Render-only methods: uniform (lidar_render, bbox, ply, bbox, poly) sig
-                _exp_methods = [
-                    ("phase_corr",    auto_snip_lidar.register_lidar_to_ply_world_phase_corr),
-                    ("prerot_akaze",  auto_snip_lidar.register_lidar_to_ply_world_prerot_akaze),
-                    ("annot_bndry",   auto_snip_lidar.register_lidar_to_ply_world_annot_boundary),
-                    ("dist_pca",      auto_snip_lidar.register_lidar_to_ply_world_dist_pca),
-                    ("pca_chamfer",   auto_snip_lidar.register_lidar_to_ply_world_pca_chamfer),
-                    ("mutual_info",   auto_snip_lidar.register_lidar_to_ply_world_mutual_info),
-                ]
-                if os.environ.get("ANTHROPIC_API_KEY"):
-                    _exp_methods.append(
-                        ("claude_vision", auto_snip_lidar.register_lidar_to_ply_world_claude_vision)
-                    )
-                    _exp_methods.append(
-                        ("claude_vision_nochamfer", auto_snip_lidar.register_lidar_to_ply_world_claude_vision)
-                    )
-                for _mname, _mfn in _exp_methods:
-                    print(f"  [Exp] Running {_mname} ...")
-                    _extra = {}
-                    if _mname in ("claude_vision", "claude_vision_nochamfer"):
-                        _extra["xz_polygons"] = lidar.get("xz_polygons")
-                        _extra["lidar_render_display"] = lidar.get("lidar_render_display")
-                    if _mname == "claude_vision_nochamfer":
-                        _extra["use_chamfer"] = False
-                    try:
-                        _, _, _mnote, _mdbg = _mfn(
-                            lidar["lidar_render"], lidar["lidar_xz_bbox"],
-                            render_img, render_world_bbox,
-                            lidar["xz_polygon"],
-                            **_extra,
-                        )
-                        for _key, _img in _mdbg.items():
-                            _p = os.path.join(output_dir,
-                                              f"debug_SU{su_number}_{_mname}_{_key}.png")
-                            cv2.imwrite(_p, _img)
-                        print(f"  [Exp:{_mname}] {_mnote}")
-                    except Exception as _merr:
-                        print(f"  [Exp:{_mname}] Failed: {_merr}")
-
-                # DEM-ridge method: needs lidar_pts + dem_path (separate signature)
-                if os.path.exists(dem_path):
-                    print(f"  [Exp] Running dem_ridge ...")
-                    try:
-                        _, _, _rnote, _rdbg = \
-                            auto_snip_lidar.register_lidar_to_ply_world_dem_ridge(
-                                lidar["lidar_pts"], lidar["lidar_xz_bbox"],
-                                dem_path, render_world_bbox,
-                                lidar["lidar_render"], render_img,
-                                lidar["xz_polygon"],
-                            )
-                        for _key, _img in _rdbg.items():
-                            _p = os.path.join(output_dir,
-                                              f"debug_SU{su_number}_dem_ridge_{_key}.png")
-                            cv2.imwrite(_p, _img)
-                        print(f"  [Exp:dem_ridge] {_rnote}")
-                    except Exception as _rerr:
-                        print(f"  [Exp:dem_ridge] Failed: {_rerr}")
-
-                # Transform all polygon clusters; crop is the union of all of them
-                yellow_worlds = [transform(poly) for poly in lidar["xz_polygons"]]
-                yellow_world  = yellow_worlds[0]  # largest, for display/reference
-                if len(yellow_worlds) > 1:
-                    print(f"  Multi-polygon: {len(yellow_worlds)} regions detected")
+                _, yellow_worlds = run_autosnip(
+                    lidar, render_img, render_world_bbox, output_dir, su_number
+                )
+                if yellow_worlds is None:
+                    print(f"  All registration methods failed for SU {su_number}, skipping.")
+                    continue
 
             # ------------------------------------------------------------------
-            # Branch B: PNG annotation (top-down photo with painted color lines)
+            # MANUAL SNIP: hand-annotated PLY ortho PNG with black stroke outline
             # ------------------------------------------------------------------
             elif ext == '.png':
-                su_number = parse_su_number(annotation_path)
+                su_number = parse_su_number(annotation_path) or job.get("su", "unknown")
                 print(f"  SU number: {su_number}")
 
-                img_bgr = cv2.imread(annotation_path)
-                if img_bgr is None:
-                    print(f"  Error: cannot read {annotation_path}")
-                    continue
-
-                yellow_px = extract_polygon_for_color(img_bgr, "yellow")
-                if yellow_px is None:
-                    print(f"  Error: no yellow polygon found in {annotation_path}")
-                    continue
-                print(f"  Yellow polygon: {len(yellow_px)} hull vertices")
-
                 try:
-                    transform, debug_ann = find_annotation_to_world_transform(
-                        img_bgr, render_img, render_world_bbox, yellow_px
+                    yellow_worlds = run_manual_snip(
+                        annotation_path, render_img, render_world_bbox
                     )
-                except RuntimeError as e:
-                    print(f"  Error: {e}")
+                except Exception as e:
+                    print(f"  Error in manual snip: {e}")
                     continue
 
-                cv2.imwrite(os.path.join(output_dir, f"debug_SU{su_number}_annotation.png"), debug_ann)
-                yellow_world  = transform(yellow_px)
-                yellow_worlds = [yellow_world]
+                # Debug: ortho with extracted polygon overlaid
+                ann_dbg = cv2.imread(annotation_path).copy()
+                rH, rW = render_img.shape[:2]
+                rx0, ry0, rx1, ry1 = render_world_bbox
+                for yw in yellow_worlds:
+                    rpx = np.empty((len(yw), 2), dtype=int)
+                    rpx[:, 0] = np.clip(
+                        ((yw[:, 0] - rx0) / (rx1 - rx0) * rW).astype(int), 0, rW - 1)
+                    rpx[:, 1] = np.clip(
+                        ((ry1 - yw[:, 1]) / (ry1 - ry0) * rH).astype(int), 0, rH - 1)
+                    cv2.polylines(ann_dbg, [rpx.reshape(-1, 1, 2)], True, (0, 255, 0), 3)
+                dbg_path = os.path.join(output_dir, f"debug_SU{su_number}_manual_annotation.png")
+                cv2.imwrite(dbg_path, ann_dbg)
+                print(f"  Manual annotation debug saved: {os.path.basename(dbg_path)}")
 
             else:
                 print(f"  Unsupported annotation format '{ext}', skipping.")
@@ -580,18 +372,23 @@ if __name__ == "__main__":
             # ------------------------------------------------------------------
             # Common: print world extent, save snip reference, crop, save
             # ------------------------------------------------------------------
-            print(f"  Yellow polygon world extent: "
+            yellow_world = yellow_worlds[0]
+            if len(yellow_worlds) > 1:
+                print(f"  Multi-polygon: {len(yellow_worlds)} regions detected")
+
+            print(f"  Polygon world extent: "
                   f"X=[{yellow_world[:,0].min():.3f}, {yellow_world[:,0].max():.3f}]  "
                   f"Y=[{yellow_world[:,1].min():.3f}, {yellow_world[:,1].max():.3f}]")
 
-            # Snip reference: full render (left) | dimmed render + all polygons highlighted (right)
             rH, rW = render_img.shape[:2]
             rx0, ry0, rx1, ry1 = render_world_bbox
 
             def _world_to_render_px(yw):
                 px = np.empty((len(yw), 2), dtype=int)
-                px[:, 0] = np.clip(((yw[:, 0] - rx0) / (rx1 - rx0) * rW).astype(int), 0, rW-1)
-                px[:, 1] = np.clip(((ry1 - yw[:, 1]) / (ry1 - ry0) * rH).astype(int), 0, rH-1)
+                px[:, 0] = np.clip(
+                    ((yw[:, 0] - rx0) / (rx1 - rx0) * rW).astype(int), 0, rW - 1)
+                px[:, 1] = np.clip(
+                    ((ry1 - yw[:, 1]) / (ry1 - ry0) * rH).astype(int), 0, rH - 1)
                 return px
 
             highlight = render_img.copy()
@@ -599,19 +396,19 @@ if __name__ == "__main__":
             for yw in yellow_worlds:
                 rpx = _world_to_render_px(yw)
                 cv2.fillPoly(su_mask, [rpx.reshape(-1, 1, 2)], 255)
-            highlight[su_mask == 0] = (highlight[su_mask == 0].astype(float) * 0.35).astype(np.uint8)
+            highlight[su_mask == 0] = (
+                highlight[su_mask == 0].astype(float) * 0.35).astype(np.uint8)
             for yw in yellow_worlds:
                 rpx = _world_to_render_px(yw)
-                cv2.polylines(highlight, [rpx.reshape(-1, 1, 2)], isClosed=True, color=(0, 255, 0), thickness=4)
+                cv2.polylines(highlight, [rpx.reshape(-1, 1, 2)], True, (0, 255, 0), 4)
 
             snip_ref = np.hstack([render_img, highlight])
             ref_path = os.path.join(output_dir, f"debug_SU{su_number}_snip_reference.png")
             cv2.imwrite(ref_path, snip_ref)
-            print(f"  Snip reference saved: {ref_path}")
+            print(f"  Snip reference saved: {os.path.basename(ref_path)}")
 
-            # Crop both clouds to the union of all yellow polygons
             print("  Cropping top cloud...")
-            top_cropped = crop_cloud_by_polygon_2d(top_cloud, yellow_worlds)
+            top_cropped    = crop_cloud_by_polygon_2d(top_cloud, yellow_worlds)
             print("  Cropping bottom cloud...")
             bottom_cropped = crop_cloud_by_polygon_2d(bottom_cloud, yellow_worlds)
 
@@ -622,13 +419,19 @@ if __name__ == "__main__":
             print(f"  Top cropped: {top_cropped.size()} pts  "
                   f"Bottom cropped: {bottom_cropped.size()} pts")
 
-            top_path = save_cleaned_cloud(top_cropped,    output_dir, top_id,    su_number, is_top=False)
-            bot_path = save_cleaned_cloud(bottom_cropped, output_dir, bottom_id, su_number, is_top=False)
+            top_path = save_cleaned_cloud(
+                top_cropped,    output_dir, top_id,    su_number, is_top=False)
+            bot_path = save_cleaned_cloud(
+                bottom_cropped, output_dir, bottom_id, su_number, is_top=False)
             print(f"  Saved: {os.path.basename(top_path)}")
             print(f"  Saved: {os.path.basename(bot_path)}")
 
             poly_path = os.path.join(output_dir, f"su_{su_number}_polygon.npy")
             np.save(poly_path, yellow_world)
-            print(f"  Saved polygon: su_{su_number}_polygon.npy")
+            print(f"  Saved polygon: {os.path.basename(poly_path)}")
 
     print("\nAuto-snip complete.")
+
+
+if __name__ == "__main__":
+    run_snip_pipeline(sys.argv[1] if len(sys.argv) > 1 else "input.json")

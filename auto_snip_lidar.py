@@ -1312,7 +1312,8 @@ def register_lidar_to_ply_world_pca_chamfer(
 
 
 # ---------------------------------------------------------------------------
-# Claude Vision registration — semantic localization + Chamfer precision
+# Claude Vision registration — DISABLED (rename _DISABLED_ → remove prefix to re-enable)
+# Requires: ANTHROPIC_API_KEY, pip install anthropic
 #
 # Sends a side-by-side composite (LiDAR annotation | PLY render) to the
 # Anthropic API.  Claude identifies approximately where the annotated room
@@ -1323,7 +1324,7 @@ def register_lidar_to_ply_world_pca_chamfer(
 # Requires: ANTHROPIC_API_KEY env var, `pip install anthropic`
 # ---------------------------------------------------------------------------
 
-def _call_claude_for_region(
+def _DISABLED_call_claude_for_region(
     composite_bgr: np.ndarray,
     left_w: int,
     right_w: int,
@@ -1463,7 +1464,7 @@ def _call_claude_for_region(
         raise RuntimeError(f"Claude response parse failed: {e}  raw={raw[:300]!r}")
 
 
-def register_lidar_to_ply_world_claude_vision(
+def _DISABLED_register_lidar_to_ply_world_claude_vision(
     lidar_render: np.ndarray,
     lidar_xz_bbox: tuple,
     ply_render: np.ndarray,
@@ -1561,7 +1562,7 @@ def register_lidar_to_ply_world_claude_vision(
     # ------------------------------------------------------------------
     print(f"  [ClaudeVision] Calling {model} (ann_frac={ann_frac:.0%}, "
           f"n_polys={len(xz_polygons)}) ...")
-    result = _call_claude_for_region(
+    result = _DISABLED_call_claude_for_region(
         composite, lsW, psW, psH, ann_frac, len(xz_polygons), model)
     print(f"  [ClaudeVision] reasoning: {result['reasoning']}")
 
@@ -1642,7 +1643,7 @@ def register_lidar_to_ply_world_claude_vision(
         best_rot  = fixed_rot
         for _retry in range(2):
             try:
-                _r     = _call_claude_for_region(
+                _r     = _DISABLED_call_claude_for_region(
                     composite, lsW, psW, psH, ann_frac, len(xz_polygons), model)
                 _dst   = np.array([_r["cx"] / p_scale, _r["cy"] / p_scale])
                 _rot   = fixed_rot

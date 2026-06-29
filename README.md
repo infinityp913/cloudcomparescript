@@ -2,14 +2,14 @@
 
 ## 3D Volume Analysis for Archaeological Stratigraphic Units
 
-Part of the **[Tharros Archaeological Research Project (TARP)](https://air.ht.lu.se/s/tharros/page/home)** — an automated pipeline for converting 3D PLY models into volumetric measurements of archaeological Stratigraphic Units (SUs). The workflow combines automated preprocessing, automated snipping via image registration and point cloud analysis, and automated post-processing to generate accurate 3D volumes.
+Part of the **[Tharros Archaeological Research Project (TARP)](https://air.ht.lu.se/s/tharros/page/home)** — an automated pipeline for converting 3D PLY models into volumetric measurements of archaeological Stratigraphic Units (SUs). The workflow combines automated preprocessing, automated snipping via image registration and point cloud analysis, and post-processing to generate accurate 3D volumes.
 
 ## Overview
 
 The pipeline processes paired top and bottom 3D models (PLY files) representing archaeological layers to compute the volume of material between them.
 
 1. **Pre-snip** (`pre_snip_script.py`): Loads PLY meshes, samples them to point clouds, computes bidirectional cloud-to-cloud (C2C) distances, and saves `.bin` files with distance scalar fields.
-2. **Auto-snip** (`auto_snip_script.py`): Automatically isolates each SU's region using an annotation image, replacing the previous manual CloudCompare step.
+2. **Auto-snip** (`auto_snip_script.py`): Locates the SU annotation in the PLY world frame and crops both clouds to that region. Supports two modes — **autosnip** (iPhone LiDAR USDZ) and **manual snip** (annotated ortho PNG).
 3. **Post-snip** (`post_snip_script.py`): Merges top and bottom cropped clouds, runs Poisson surface reconstruction, and computes 3D and 2.5D volumes.
 
 ## Project Structure
@@ -17,17 +17,21 @@ The pipeline processes paired top and bottom 3D models (PLY files) representing 
 ```
 cloudcomparescript/
 ├── pre_snip_script.py          # Step 1: distance computation
-├── auto_snip_script.py         # Step 2: automated snipping
+├── auto_snip_script.py         # Step 2: snipping (autosnip or manual)
+├── auto_snip_lidar.py          # Registration library (all LiDAR methods)
 ├── post_snip_script.py         # Step 3: mesh generation and volume calculation
 ├── run.sh                      # Wrapper to run scripts with correct CloudComPy env
-├── example.json                # Global job pair configuration
-├── example-17000.json          # Per-season config with annotation filenames
-├── SU_*_annotation.png         # Annotation images (one per SU)
+├── input.json                  # Canonical input — edit this for your run
+├── example-*.json              # Per-site example configs
+├── eval_methods.py             # Registration method evaluation script
 ├── volume_measures.txt         # Output volume measurements
 └── Data/
     ├── Final_Volumes/          # Final SU volume meshes (OBJ)
+    ├── eval/                   # eval_methods.py debug composites
     └── Pgram_Job_*/            # Per-job intermediate files and debug renders
 ```
+
+---
 
 ## Prerequisites
 
@@ -76,101 +80,112 @@ conda install -y boost cgal cmake draco "ffmpeg=6.1" gdal jupyterlab laszip \
 Use `run.sh` (sets `PYTHONPATH` to include CloudComPy frameworks):
 
 ```bash
-./run.sh pre_snip_script.py
-./run.sh auto_snip_script.py
-./run.sh post_snip_script.py
+./run.sh pre_snip_script.py input.json
+./run.sh auto_snip_script.py input.json
+./run.sh post_snip_script.py input.json
 ```
 
-### Opening Files in CloudCompare GUI
+All three scripts are also importable Python modules:
 
-Use `open -a` (LaunchServices). Direct binary invocation produces "no access right" errors on macOS. File > Open inside CloudCompare does not open a file picker.
+```python
+import pre_snip_script, auto_snip_script, post_snip_script
 
-```bash
-# Files with spaces/commas in names must be copied to /tmp first
-cp "Data/Pgram_Job_720_SU17007, 17008,17011_cleaned_su_17015.bin" /tmp/bottom.bin
-open -a "~/Desktop/CloudComPy310_clean/CloudCompare/CloudCompare.app" /tmp/top.bin /tmp/bottom.bin
+pre_snip_script.run_presnip_pipeline("input.json")
+auto_snip_script.run_snip_pipeline("input.json")
+post_snip_script.run_postsnip_pipeline("input.json")
 ```
 
 ---
 
 ## Usage Workflow
 
-### Step 1: Configure Input Models
+### Step 1: Configure input.json
 
 Place PLY files in `~/Documents/TARP/ply/` with naming convention:
 `Pgram_Job_<job_number>_SU<su_numbers>.ply`
 
-Edit the JSON config for the season you're processing (e.g. `example-17000.json`):
+Edit `input.json` for the SU you're processing:
 
 ```json
 [
   {
-    "top": "710",
-    "bottom": "720",
-    "annotations": ["SU_17015_annotation.png"]
+    "top": "786",
+    "bottom": "787",
+    "annotations": ["../lidars/tarpf24477.usdz"]
   }
 ]
 ```
 
 - `"top"` / `"bottom"`: job numbers matching PLY filenames
-- `"annotations"`: list of annotation PNG filenames (one per SU in this pair)
+- `"annotations"`: list of annotation file paths — mode is inferred from extension:
+  - `.usdz` → autosnip (iPhone LiDAR scan with yellow-painted annotation)
+  - `.png` → manual snip (annotated PLY ortho with black stroke outline)
 
 ### Step 2: Run Pre-snip
 
 ```bash
-./run.sh pre_snip_script.py
+./run.sh pre_snip_script.py input.json
 ```
 
-Loads paired PLY meshes, samples them to point clouds, computes bidirectional C2C distances, and saves `*.clone_top_with_dist_*.bin` and `*.clone_bottom_with_dist_*.bin` in `Data/<top_job_folder>/`.
+Loads paired PLY meshes, samples them to point clouds, computes bidirectional C2C distances, and saves `*_top_with_dist_*.bin` and `*_bottom_with_dist_*.bin` in `Data/<top_job_folder>/`.
 
 ### Step 3: Run Auto-snip
 
 ```bash
-./run.sh auto_snip_script.py
+./run.sh auto_snip_script.py input.json
 ```
 
-For each job pair, this script:
+#### Mode A — Autosnip (USDZ)
 
-1. **Loads the pre-snip clouds** from Step 2.
-2. **Renders a top-down orthographic image** of the top cloud (1 cm/px, RGB colors from photogrammetry). This render looks like the scene viewed from directly above.
-3. **Extracts the yellow polygon** from the annotation PNG. The annotation image is a top-down aerial photo of the trench with three types of annotation lines drawn in pure, vibrant colors:
-   - **Red + Blue**: together outline the full trench boundary
-   - **Yellow**: outlines the specific SU being measured
-   
-   Yellow pixels are detected in HSV color space (S > 150 to exclude muted terrain colors). Connected-component analysis isolates the dominant cluster (the annotation line), and its convex hull becomes the SU polygon.
+For each USDZ annotation, the script:
 
-4. **Aligns annotation → render using PCA** (Principal Component Analysis):
+1. Loads the iPhone LiDAR scan and extracts the yellow-painted annotation polygon.
+2. Renders a top-down orthographic image of the PLY top cloud (1 cm/px, RGB colors from photogrammetry).
+3. Runs 5 registration methods to align the LiDAR scan to the PLY world frame. `rgb_pca` is the default used for the crop; all 5 save side-by-side debug composites for comparison.
+4. Transforms the yellow polygon to PLY world coordinates.
+5. Crops both clouds (top and bottom) to that polygon.
+6. Saves `*_cleaned_su_<N>.bin` files and debug images in `Data/<json_id>/`.
 
-   Feature matching (ORB/SIFT) fails here because the annotation photo and the orthographic render have a large rotation difference (~35°) and different visual characteristics. Instead, geometric alignment is used:
+**Registration methods** (ranked by mean centroid error across 4 sites):
 
-   - **PCA on red+blue outline pixels** (annotation): the annotation lines form an elongated blob matching the trench shape. PCA finds the blob's centroid, principal axis (long axis of the trench), and spread along each axis (trench length and width in pixel units).
-   - **PCA on non-black pixels** (render): the point cloud footprint is the exact trench area. PCA finds its centroid, principal axis, and spread in render pixel units.
-   - **Similarity transform**: since both PCAs describe the same physical trench, their parameters can be directly aligned:
-     - **Rotation**: difference in principal axis angles (e.g. 73° annotation → -149° render = -222° rotation)
-     - **Scale**: ratio of spreads (render length / annotation length ≈ 0.95)
-     - **Translation**: after rotating and scaling around the annotation centroid, shift to land on the render centroid
-   - The 180° ambiguity in PCA eigenvectors is resolved by trying both orientations and keeping whichever places the yellow polygon within the render image bounds.
+| Method | Mean error | Notes |
+|--------|-----------|-------|
+| `rgb_pca` (**default**) | 1.30 m | PCA on RGB footprints — wins overall |
+| `dist_pca` | 1.34 m | Distance-weighted PCA variant |
+| `phase_corr` | 2.56 m | Phase correlation on Canny edges |
+| `prerot_akaze` | 2.63 m | AKAZE — fails when LiDAR ≠ PLY texture |
+| `pca_chamfer` | 2.86 m | PCA rotation + Chamfer translation |
 
-5. **Transforms the yellow polygon** through the similarity transform → render pixel space → world XY coordinates (using the render's known pixel-to-world linear mapping).
+If `rgb_pca` gives the wrong result, inspect the other method debug images and re-run with the correct annotated ortho in manual snip mode.
 
-6. **Crops both clouds** (top and bottom) to only keep points whose XY falls inside the world-space polygon, using a CloudComPy scalar field mask + `filterBySFValue`.
+#### Mode B — Manual Snip (PNG)
 
-7. **Saves** `*_cleaned_su_<N>.bin` files in `Data/<top_job_folder>/` alongside debug images:
-   - `debug_topdown_render.png`: the top-down render of the full cloud
-   - `debug_SU<N>_render_overlay.png`: render with the transformed polygon drawn in green
+Draw the annotation as a **black outline** on the PLY top-down render (`debug_topdown_render.png`), then point `input.json` to that image:
+
+```json
+[
+  {
+    "top": "786",
+    "bottom": "787",
+    "su": "20002",
+    "annotations": ["orthos/ortho_20002_annotated.png"]
+  }
+]
+```
+
+The script detects black pixels, fills the enclosed region, and maps the polygon from ortho pixel space to PLY world coordinates.
 
 ### Step 4: Generate Final Volumes
 
 ```bash
-./run.sh post_snip_script.py
+./run.sh post_snip_script.py input.json
 ```
 
 For each matched `*_cleaned_su_<N>.bin` pair:
-- Computes normals (inverts bottom cloud normals so they point inward)
+- Computes normals (inverts bottom cloud normals to point inward)
 - Merges top and bottom clouds
-- Runs Poisson surface reconstruction (depth=11)
-- Computes 3D mesh volume (`cc.ccMesh.computeMeshVolume`) in cm³
-- Computes 2.5D projected volume (`cc.ComputeVolume25D`)
+- Runs Poisson surface reconstruction (depth=11) with density trimming at p10 (removes phantom boundary faces)
+- Computes 3D mesh volume in cm³ and 2.5D projected volume in m³
 - Appends to `volume_measures.txt`
 - Saves `Data/Final_Volumes/SU_<N>_raw.obj` and `Data/<top_folder>/SU_<N>_top_raw.obj`
 
@@ -180,25 +195,14 @@ For each matched `*_cleaned_su_<N>.bin` pair:
 
 | File | Description |
 |------|-------------|
-| `Data/<top_folder>/*_cleaned_su_<N>.bin` | Cropped point clouds for each SU |
+| `Data/<json_id>/*_cleaned_su_<N>.bin` | Cropped point clouds for each SU |
 | `Data/Final_Volumes/SU_<N>_raw.obj` | Merged Poisson mesh for volume calculation |
 | `Data/<top_folder>/SU_<N>_top_raw.obj` | Top surface mesh |
-| `Data/<top_folder>/<N>_post_snip.bin` | CloudCompare project file for review |
 | `volume_measures.txt` | Tab-separated: SU name, 3D volume (cm³), 2.5D volume (m³), warnings |
-| `Data/<top_folder>/debug_topdown_render.png` | Top-down render used for alignment |
-| `Data/<top_folder>/debug_SU<N>_render_overlay.png` | Polygon overlay on render for QC |
-
----
-
-## Annotation Image Format
-
-Each `SU_<N>_annotation.png` is a top-down aerial photograph of the excavation trench with annotation lines:
-
-- **Red polyline**: one side of the trench boundary
-- **Blue polyline**: the other side (together red+blue = full trench)
-- **Yellow polyline**: boundary of the specific SU being measured
-
-The yellow line is drawn by the archaeologist to mark the horizontal extent of an SU on the surface. One annotation image per SU; multiple SUs in the same job pair each get their own annotation file listed in the JSON.
+| `Data/<json_id>/debug_topdown_render.png` | Top-down PLY render used for alignment |
+| `Data/<json_id>/debug_SU<N>_{method}_lidar_vs_result.png` | LiDAR vs PLY comparison per method |
+| `Data/<json_id>/debug_SU<N>_manual_annotation.png` | Ortho with extracted polygon (manual snip) |
+| `Data/<json_id>/debug_SU<N>_snip_reference.png` | Crop region overlay on PLY render |
 
 ---
 
@@ -206,9 +210,9 @@ The yellow line is drawn by the archaeologist to mark the horizontal extent of a
 
 **CloudComPy import fails ("library load disallowed by system policy")**: Re-run the `codesign` command from the Prerequisites section — the entitlements plist at `/tmp/` is ephemeral and may need to be recreated after a reboot.
 
-**Yellow polygon not detected**: Check that the annotation PNG uses pure yellow (H=20-40°, S>150 in HSV). If the annotation tool uses a different color, update `color_ranges` in `extract_polygon_for_color`.
+**Autosnip result is in the wrong location**: Inspect the `debug_SU<N>_{method}_lidar_vs_result.png` images for all 5 methods. If none are correct, switch to manual snip: draw the crop boundary in black on `debug_topdown_render.png` and re-run.
 
-**PCA alignment clearly wrong**: Visually inspect `debug_SU<N>_render_overlay.png`. If the polygon is in the wrong location, the red+blue outlines in the annotation may not sufficiently cover the trench shape for PCA alignment. Consider using the C2C distance scalar field from the pre-snip output to identify high-difference regions as a cross-check.
+**No annotation polygon found in manual snip**: Ensure black strokes are truly black (all channels < 50). Increase the morphological close kernel in `run_manual_snip()` if stroke gaps are large.
 
 **"no access right" when opening files in CloudCompare**: Use `open -a` (LaunchServices) rather than calling the binary directly. Copy files with special characters (spaces, commas) to `/tmp/` first.
 
@@ -216,8 +220,8 @@ The yellow line is drawn by the archaeologist to mark the horizontal extent of a
 
 ---
 
-## Future Enhancements
+## API / Vision Methods (Disabled)
 
-- **C2C-based snipping**: Use the C2C distance scalar field already present in pre-snip bins to locate SUs geometrically — regions of anomalously high distance between surfaces correspond to SU locations, eliminating dependence on annotation image registration.
-- **Multiple SUs per pair**: Already supported in JSON (`"annotations": ["SU_A.png", "SU_B.png"]`); each annotation produces its own cleaned pair.
-- **Incremental processing**: Skip SUs already present in `Data/Final_Volumes/`.
+Claude Vision (`claude-haiku-4-5-20251001`) and OpenRouter model methods are preserved in `auto_snip_lidar.py` as `_DISABLED_call_claude_for_region` and `_DISABLED_register_lidar_to_ply_world_claude_vision`. To re-enable, remove the `_DISABLED_` prefix from the function names and set `ANTHROPIC_API_KEY` in `.env`.
+
+Evaluation across 4 sites showed `gemini-2.5-flash` (via OpenRouter) achieves 1.39 m mean centroid error — essentially tied with `rgb_pca` (1.30 m) but at API cost. See `eval_methods.py` for the full evaluation framework.

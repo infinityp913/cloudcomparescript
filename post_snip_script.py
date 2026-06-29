@@ -10,12 +10,7 @@ import numpy as np
 from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project
 import glob
 
-json_filepath = sys.argv[1] if len(sys.argv) > 1 else "example.json"
-json_id = os.path.splitext(os.path.basename(json_filepath))[0]  # e.g. "example-20002"
 POINT_CLOUD_DIR = "Data"
-
-with open(json_filepath, "r") as f:
-    job_data = json.load(f)
 
 
 def get_job_number_from_filename(filename):
@@ -58,7 +53,7 @@ def get_su_number_from_filename(filename):
     return None
 
 
-def find_top_bottom_cloud_pairs(point_cloud_dir):
+def find_top_bottom_cloud_pairs(point_cloud_dir, json_id):
     """
     Find top+bottom cloud pairs written by auto_snip into the per-JSON output folder.
     The folder is named after the JSON file (e.g. Data/example-20002/).
@@ -481,9 +476,18 @@ def update_volume_measurements(volume_file, su_name, volume_3d, volume_25d, isWa
         vol_file.writelines(lines)
 
 
-if __name__ == "__main__":
-    # Find all top and bottom cloud pairs
-    pairs = find_top_bottom_cloud_pairs(POINT_CLOUD_DIR)
+def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
+    """
+    Main entry point for post-snip processing.
+    Finds cropped cloud pairs from auto_snip output, runs Poisson reconstruction,
+    computes volumes, and saves meshes.
+
+    Callable from any external Python program:
+        import post_snip_script
+        post_snip_script.run_postsnip_pipeline("input.json")
+    """
+    json_id = os.path.splitext(os.path.basename(json_filepath))[0]
+    pairs = find_top_bottom_cloud_pairs(POINT_CLOUD_DIR, json_id)
 
     for i, (top_cloud_path, bottom_cloud_path) in enumerate(pairs):
         top_base_name = os.path.basename(top_cloud_path).split("_cleaned_su_")[0]
@@ -495,36 +499,29 @@ if __name__ == "__main__":
         )
 
         try:
-            # Call the function to merge clouds and build mesh
             (
                 merged_cloud,
                 top_cloud,
                 bottom_cloud,
                 merged_mesh,
                 top_mesh,
-                # top_mesh_filtered,
             ) = merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path)
 
             if merged_cloud is not None and merged_mesh is not None:
                 project_name = f"{top_base_name}/{su_number}_post_snip.bin"
                 project_path = os.path.join(DATA_DIR, project_name)
                 save_project(
-                    [
-                        merged_cloud,
-                        top_cloud,
-                        bottom_cloud,
-                        merged_mesh,
-                        top_mesh,
-                        # top_mesh_filtered,
-                    ],
+                    [merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh],
                     project_path,
                 )
-                print(
-                    f"Successfully finished processing {su_number} and saved project at {project_path}"
-                )
+                print(f"Successfully finished processing {su_number} and saved project at {project_path}")
             else:
                 print(f"Failed to process {su_number}")
 
         except Exception as e:
             print(f"Unexpected error processing {su_number}: {e}")
             continue
+
+
+if __name__ == "__main__":
+    run_postsnip_pipeline(sys.argv[1] if len(sys.argv) > 1 else "input.json")

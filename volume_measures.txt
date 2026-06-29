@@ -131,3 +131,4 @@ SU20001,_20002,_20003	64002.33	0.11172418278286114	There might be a hole in the 
 SU20005	287505.58	0.46052795589094003	There might be a hole in the mesh.
 SU20001,_20002,_20003	701245.7	4.092548925972353	There might be a hole in the mesh.
 SU12001	344222.84	0.5148796816989494	There might be a hole in the mesh.
+SU12001	872503.76	0.6101203757510351	There might be a hole in the mesh.

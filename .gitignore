@@ -39,3 +39,5 @@ Data/DEMs/
 
 # Claude Code internals
 .claude/
+.gstack/
+Data/eval/
