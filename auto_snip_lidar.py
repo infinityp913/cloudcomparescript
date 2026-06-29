@@ -223,6 +223,23 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
             tex_h, tex_w = texture.shape[:2]
             print(f"  Texture: {tex_w}×{tex_h}")
 
+            # Build a display-quality texture: fill pure-black atlas-gap pixels
+            # (max channel < 20) with nearest-neighbour colour from surrounding
+            # islands so UV interpolation doesn't land on black padding.
+            # IMPORTANT: keep the original texture for img_raw rendering — the
+            # pre-fill changes enough pixels (475k+ for some USDZs) to shift
+            # the PCA footprint and flip the 180° ambiguity check.
+            from scipy.ndimage import distance_transform_edt
+            _tex_dark = texture.max(axis=2) < 20
+            if _tex_dark.any():
+                print(f"  Filling {_tex_dark.sum()} atlas-gap pixels ...")
+                _, _tex_nn = distance_transform_edt(_tex_dark, return_indices=True)
+                texture_display = texture.copy()
+                texture_display[_tex_dark] = texture_display[
+                    _tex_nn[0][_tex_dark], _tex_nn[1][_tex_dark]]
+            else:
+                texture_display = texture
+
             # ----------------------------------------------------------------
             # Per-vertex UV → texture color, averaged across face vertices.
             # Sampling at each vertex then averaging gives more accurate color
@@ -231,7 +248,7 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
             # ----------------------------------------------------------------
             tex_px_v = np.clip((sts[:, 0] * tex_w).astype(np.int32), 0, tex_w - 1)
             tex_py_v = np.clip(((1.0 - sts[:, 1]) * tex_h).astype(np.int32), 0, tex_h - 1)
-            vertex_colors = texture[tex_py_v, tex_px_v]            # (V, 3) BGR
+            vertex_colors = texture_display[tex_py_v, tex_px_v]    # (V, 3) BGR
             face_colors = vertex_colors[fvi].mean(axis=1).astype(np.uint8)  # (F, 3) BGR
 
             yellow_mask = _yellow_mask_bgr(face_colors)
@@ -261,10 +278,10 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
                   f"Z=[{xz_pts[:,1].min():.2f}, {xz_pts[:,1].max():.2f}]")
 
             # ----------------------------------------------------------------
-            # Top-down render: XZ projection with texture colors.
-            # Rasterise full triangles (painter's algorithm, back-to-front
-            # in Y) so every pixel inside a face is filled. This eliminates
-            # the graininess that vertex-splatting + dilation produces.
+            # Top-down render: XZ projection with UV-interpolated texture.
+            # Uses barycentric sampling across each face so every pixel
+            # gets the correctly-interpolated texture colour rather than a
+            # flat per-face average.  Fully vectorised — no Python loop.
             # ----------------------------------------------------------------
             x, z = pts[:, 0], pts[:, 2]
             x0, z0 = float(x.min()), float(z.min())
@@ -275,36 +292,88 @@ def process_usdz(usdz_path: str, resolution: float = 0.01) -> dict:
 
             img = np.zeros((H, W, 3), dtype=np.uint8)
 
-            # Project all vertices to image coords
-            v_px = np.clip(((x - x0) / resolution).astype(np.int32), 0, W - 1)
-            v_pz = np.clip(((z - z0) / resolution).astype(np.int32), 0, H - 1)
+            # Project all vertices to float image coords for interpolation
+            v_px_f = (x - x0) / resolution          # (V,) float
+            v_pz_f = (z - z0) / resolution          # (V,) float
 
-            # Per-face: projected vertex coords and centroid texture color
-            face_cols = np.stack([v_px[fvi[:, 0]], v_pz[fvi[:, 0]],
-                                  v_px[fvi[:, 1]], v_pz[fvi[:, 1]],
-                                  v_px[fvi[:, 2]], v_pz[fvi[:, 2]]], axis=1)  # (F, 6)
+            # Barycentric grid: n_sub=8 → 45 sample points per face.
+            # Covers triangles up to ~8px across without visible gaps.
+            n_sub = 8
+            _t = np.linspace(0, 1, n_sub + 1, dtype=np.float32)
+            _ug, _vg = np.meshgrid(_t, _t)
+            _in = (_ug + _vg) <= 1.0
+            bc_u = _ug[_in]                          # (S,)
+            bc_v = _vg[_in]
+            bc_w = 1.0 - bc_u - bc_v
 
-            # Sort faces back-to-front by average Y (height) so higher
-            # surfaces overwrite lower ones (painter's algorithm)
+            # Face vertex image coords (float) — shape (F, 3)
+            fvx = v_px_f[fvi].astype(np.float32)
+            fvz = v_pz_f[fvi].astype(np.float32)
+
+            # Face vertex texture coords — shape (F, 3)
+            fvu = sts[fvi, 0].astype(np.float32)
+            fvv = sts[fvi, 1].astype(np.float32)
+
+            # Interpolated image coords at all sample points — shape (F, S)
+            samp_x = bc_u * fvx[:, 0:1] + bc_v * fvx[:, 1:2] + bc_w * fvx[:, 2:3]
+            samp_z = bc_u * fvz[:, 0:1] + bc_v * fvz[:, 1:2] + bc_w * fvz[:, 2:3]
+            ix = np.clip(np.round(samp_x).astype(np.int32), 0, W - 1)
+            iz = np.clip(np.round(samp_z).astype(np.int32), 0, H - 1)
+
+            # UV texture sampling — atlas gaps are pre-filled so interpolated
+            # UVs can roam freely without hitting black regions.
+            samp_u = bc_u * fvu[:, 0:1] + bc_v * fvu[:, 1:2] + bc_w * fvu[:, 2:3]
+            samp_v = bc_u * fvv[:, 0:1] + bc_v * fvv[:, 1:2] + bc_w * fvv[:, 2:3]
+            tx = np.clip((samp_u * tex_w).astype(np.int32), 0, tex_w - 1)
+            ty = np.clip(((1.0 - samp_v) * tex_h).astype(np.int32), 0, tex_h - 1)
+
+            # Painter's algorithm: write faces back-to-front in Y
             face_y_avg = pts[fvi, 1].mean(axis=1)
-            face_order = np.argsort(face_y_avg)
+            order = np.argsort(face_y_avg)
 
-            print(f"  Rasterising {n_faces} triangles ...")
-            for fi in face_order:
-                tri = face_cols[fi].reshape(3, 2)
-                cv2.fillPoly(img, [tri], face_colors[fi].tolist())
+            flat_ix = ix[order].ravel()
+            flat_iz = iz[order].ravel()
+            flat_tx = tx[order].ravel()
+            flat_ty = ty[order].ravel()
 
-            # Fill small inter-triangle gaps without expanding the boundary
+            print(f"  Rasterising {n_faces} triangles ({n_sub}×{n_sub} bary samples) ...")
+
+            # img_raw: geometry-only binary mask (white where any face covers
+            # a pixel, black elsewhere).  Used for PCA rotation so the PCA
+            # footprint is purely geometric — completely independent of texture
+            # content or atlas-gap fill, which could otherwise shift the PCA
+            # axis and flip the 180° ambiguity check between runs.
+            img_mask = np.zeros((H, W), dtype=np.uint8)
+            img_mask[flat_iz, flat_ix] = 255
+            img_mask = cv2.morphologyEx(img_mask, cv2.MORPH_CLOSE,
+                                        np.ones((3, 3), np.uint8))
+            img_raw = cv2.cvtColor(img_mask, cv2.COLOR_GRAY2BGR)
+
+            # img_display: full-colour render with gap-filled texture, inpainted
+            # to fill unscanned floor voids, then gamma+CLAHE to match the
+            # brightness / tone-mapping of the USDZ viewer.
+            img[flat_iz, flat_ix] = texture_display[flat_ty, flat_tx]
             img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+            _holes = (img.max(axis=2) == 0).astype(np.uint8)
+            if _holes.any():
+                img = cv2.inpaint(img, _holes, inpaintRadius=20,
+                                  flags=cv2.INPAINT_TELEA)
+            img_f = img.astype(np.float32) / 255.0
+            img = np.clip(np.power(img_f, 0.5) * 255.0, 0, 255).astype(np.uint8)
+            _lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            _lab[:, :, 0] = _clahe.apply(_lab[:, :, 0])
+            img_display = cv2.cvtColor(_lab, cv2.COLOR_LAB2BGR)
 
             return {
-                "xz_polygon":    xz_polygon,   # largest cluster — for registration
-                "xz_polygons":   xz_polygons, # all clusters — for crop union
-                "xz_pts":        xz_pts,
-                "lidar_render":  img,
-                "lidar_xz_bbox": (x0, z0, x1, z1),
-                "lidar_pts":     pts,
-                "su_name":       su_name,
+                "xz_polygon":         xz_polygon,    # largest cluster — registration
+                "xz_polygons":        xz_polygons,   # all clusters — crop union
+                "xz_pts":             xz_pts,
+                "lidar_render":       img_raw,        # raw — used for PCA rotation
+                "lidar_render_display": img_display,  # enhanced — used for Claude prompt
+                "lidar_xz_bbox":      (x0, z0, x1, z1),
+                "lidar_pts":          pts,
+                "su_name":            su_name,
             }
 
 
@@ -1405,6 +1474,7 @@ def register_lidar_to_ply_world_claude_vision(
     use_chamfer: bool = True,
     n_retries: int = 2,
     claude_kwargs: dict = None,
+    lidar_render_display: np.ndarray = None,
 ) -> tuple:
     """Register LiDAR → PLY using Claude Vision for semantic localization.
 
@@ -1425,6 +1495,11 @@ def register_lidar_to_ply_world_claude_vision(
 
     if xz_polygons is None:
         xz_polygons = [xz_polygon]
+
+    # Enhanced render for the composite prompt and debug images.
+    # lidar_render (raw) is used only for PCA — inpainting would change the
+    # footprint shape and could flip the 180° ambiguity check.
+    _li_display = lidar_render_display if lidar_render_display is not None else lidar_render
 
     def _xz_to_li_px(xz):
         return np.stack([(xz[:, 0] - lx0) / (lx1 - lx0) * lW,
@@ -1454,7 +1529,7 @@ def register_lidar_to_ply_world_claude_vision(
     p_scale = min(max_dim / pW, max_dim / pH, 1.0)
     lsW, lsH = int(lW * l_scale), int(lH * l_scale)
     psW, psH = int(pW * p_scale), int(pH * p_scale)
-    l_small = cv2.resize(lidar_render, (lsW, lsH))
+    l_small = cv2.resize(_li_display, (lsW, lsH))
 
     # Enhance PLY brightness/contrast with CLAHE so dark renders are visible
     p_bgr = cv2.resize(ply_render, (psW, psH))
@@ -1521,18 +1596,6 @@ def register_lidar_to_ply_world_claude_vision(
     src_li    = np.array([cx_li_center, cy_li_center])
     dst_claude = np.array([cx_ply, cy_ply])
 
-    fixed_rot = rot0
-    for rot_candidate in [rot0, rot0 + 180]:
-        M_test   = _make_M3(rot_candidate, src_li, dst_claude)
-        pts_test = _apply(M_test, yellow_lidar_px)
-        margin   = 0.25
-        if (pts_test[:, 0].min() > -pW * margin and
-                pts_test[:, 0].max() < pW * (1 + margin) and
-                pts_test[:, 1].min() > -pH * margin and
-                pts_test[:, 1].max() < pH * (1 + margin)):
-            fixed_rot = rot_candidate
-            break
-
     ply_gray  = cv2.cvtColor(ply_render, cv2.COLOR_BGR2GRAY)
     ply_edges = cv2.Canny(ply_gray, 30, 120)
     ply_edges = cv2.dilate(ply_edges, np.ones((3, 3), np.uint8))
@@ -1555,6 +1618,19 @@ def register_lidar_to_ply_world_claude_vision(
         vals      = np.full(len(pp), PENALTY, dtype=np.float32)
         vals[inb] = dt[ys[inb], xs[inb]]
         return float(vals.mean())
+
+    # 180° flip disambiguation: pick the rotation that lands the polygon
+    # CLOSER to PLY wall edges (lower Chamfer cost).  The bounds check alone
+    # is too permissive — for a large site, both rotations can land inside
+    # the PLY extent, so we need an edge-quality signal to discriminate.
+    fixed_rot = rot0
+    _best_flip_cost = float('inf')
+    for _rc in [rot0, rot0 + 180]:
+        _Mt = _make_M3(_rc, src_li, dst_claude)
+        _c  = cost_fn(_Mt)
+        if _c < _best_flip_cost:
+            _best_flip_cost = _c
+            fixed_rot = _rc
 
     if not use_chamfer:
         # Skip Chamfer — use Claude's bbox center directly.
@@ -1627,7 +1703,7 @@ def register_lidar_to_ply_world_claude_vision(
         cv2.polylines(debug_img, [apx.reshape(-1, 1, 2)], True, color, 3)
 
     # lidar_vs_result: left=LiDAR (all polys in cyan/yellow), right=PLY (all polys)
-    li_panel = lidar_render.copy()
+    li_panel = _li_display.copy()
     for i, lpy in enumerate(all_yellow_li_px):
         color = (0, 255, 255) if i == 0 else (0, 255, 128)
         cv2.polylines(li_panel, [lpy.astype(np.int32).reshape(-1, 1, 2)],

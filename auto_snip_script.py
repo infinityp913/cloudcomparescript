@@ -387,11 +387,13 @@ if __name__ == "__main__":
                 su_number = lidar["su_name"]
                 print(f"  SU name from USDZ: {su_number}")
 
-                # Save LiDAR debug images
-                cv2.imwrite(os.path.join(output_dir, "debug_lidar_render.png"),
-                            lidar["lidar_render"])
+                # Save LiDAR debug images — use display render (inpainted + gamma)
+                # for visual inspection; raw render is kept in lidar["lidar_render"]
+                # for PCA computations.
+                _li_disp = lidar.get("lidar_render_display", lidar["lidar_render"])
+                cv2.imwrite(os.path.join(output_dir, "debug_lidar_render.png"), _li_disp)
                 auto_snip_lidar.save_lidar_debug(
-                    lidar["lidar_render"], lidar["xz_polygon"],
+                    _li_disp, lidar["xz_polygon"],
                     lidar["lidar_xz_bbox"],
                     os.path.join(output_dir, f"debug_SU{su_number}_lidar_yellow.png"),
                     xz_polygons=lidar.get("xz_polygons"),
@@ -439,6 +441,7 @@ if __name__ == "__main__":
                                 xz_polygons=_xz_polys,
                                 model="claude-haiku-4-5-20251001",
                                 use_chamfer=False,
+                                lidar_render_display=lidar.get("lidar_render_display"),
                             )
                         _cv_dist = reg_debug.get("meanDist", 0)
                         if _cv_dist > 100:
@@ -497,6 +500,7 @@ if __name__ == "__main__":
                     _extra = {}
                     if _mname in ("claude_vision", "claude_vision_nochamfer"):
                         _extra["xz_polygons"] = lidar.get("xz_polygons")
+                        _extra["lidar_render_display"] = lidar.get("lidar_render_display")
                     if _mname == "claude_vision_nochamfer":
                         _extra["use_chamfer"] = False
                     try:
