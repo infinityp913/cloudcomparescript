@@ -8,7 +8,7 @@ import math
 from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project
 import glob
 
-json_filepath = "example.json"
+json_filepath = "input.json"
 POINT_CLOUD_DIR = "Data"
 
 with open(json_filepath, "r") as f:

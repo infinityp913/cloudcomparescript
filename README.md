@@ -26,7 +26,7 @@ The pipeline processes paired top and bottom 3D models (PLY files) representing 
 cloudcomparescript/
 ├── pre_snip_script.py          # Preprocessing script for distance computation
 ├── post_snip_script.py         # Post-processing script for mesh generation
-├── example.json                # Configuration file for model pairs
+├── input.json                  # Configuration file for model pairs
 ├── volume_measures.txt         # Output volume measurements
 ├── Data/                       # Working directory
 │   ├── Final_Volumes/          # Final SU volume meshes (OBJ files)
@@ -95,7 +95,7 @@ mkdir -p ~/TARP/
 ### Step 1: Configure Input Models
 
 1. Place your PLY files in `~/TARP/` with naming convention: `Pgram_Job_<job_number>_SU<su_numbers>.ply`
-2. Edit `example.json` to specify top/bottom model pairs:
+2. Edit `input.json` to specify top/bottom model pairs:
 
 ```json
 [
@@ -155,7 +155,7 @@ This script will:
 
 ### JSON Configuration Format
 
-The `example.json` file defines model pairs where:
+The `input.json` file defines model pairs where:
 - `"top"`: Job number of the upper archaeological layer
 - `"bottom"`: Job number of the lower archaeological layer
 
