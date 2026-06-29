@@ -488,6 +488,11 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
     """
     json_id = os.path.splitext(os.path.basename(json_filepath))[0]
     pairs = find_top_bottom_cloud_pairs(POINT_CLOUD_DIR, json_id)
+    if not pairs:
+        raise RuntimeError(
+            f"No top/bottom cloud pairs found in {POINT_CLOUD_DIR}. Auto-snip must run "
+            f"successfully before post-snip. Run from the dashboard, not directly."
+        )
 
     for i, (top_cloud_path, bottom_cloud_path) in enumerate(pairs):
         top_base_name = os.path.basename(top_cloud_path).split("_cleaned_su_")[0]

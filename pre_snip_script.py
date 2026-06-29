@@ -390,8 +390,15 @@ def run_presnip_pipeline(json_filepath: str = "input.json") -> None:
         import pre_snip_script
         pre_snip_script.run_presnip_pipeline("input.json")
     """
+    if not os.path.exists(json_filepath):
+        raise RuntimeError(
+            f"No '{json_filepath}' found in {os.getcwd()}. This script is driven by the dashboard, "
+            f"which writes it before launching. Run it from the dashboard, not directly."
+        )
     with open(json_filepath, "r") as f:
         job_data = json.load(f)
+    if not job_data:
+        raise RuntimeError(f"'{json_filepath}' contains no jobs to process.")
 
     print("Starting pre-snip processing...")
 
