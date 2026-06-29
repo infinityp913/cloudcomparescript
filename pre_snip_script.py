@@ -6,8 +6,9 @@ import requests
 import matplotlib
 import os
 import sys
+import tarp_progress
 
-INPUT_MESH_PATH = os.path.expanduser("~/Documents/TARP/ply/")
+INPUT_MESH_PATH = os.environ.get("TARP_PLY_DIR") or os.path.expanduser("~/Documents/TARP/ply/")
 DATA_DIR = os.path.expanduser("./Data")
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -402,7 +403,9 @@ def run_presnip_pipeline(json_filepath: str = "input.json") -> None:
 
     print("Starting pre-snip processing...")
 
-    for job in job_data:
+    total = len(job_data)
+    tarp_progress.report(0, total)
+    for processed, job in enumerate(job_data):
         top_id    = find_mesh_by_pgram_job(job["top"])
         bottom_id = find_mesh_by_pgram_job(job["bottom"])
         print(f"Processing job: Top ID = {top_id}, Bottom ID = {bottom_id}")
@@ -421,6 +424,7 @@ def run_presnip_pipeline(json_filepath: str = "input.json") -> None:
         os.makedirs(output_dir, exist_ok=True)
         save_cloud(output_dir, top_with_dist,    f"top_with_dist_for_{bottom_id}")
         save_cloud(output_dir, bottom_with_dist, f"bottom_with_dist_for_{top_id}")
+        tarp_progress.report(processed + 1, total, top_id)
 
     print("Completed pre-snip processing.")
 

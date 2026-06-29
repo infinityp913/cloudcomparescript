@@ -8,6 +8,7 @@ import glob
 
 from pre_snip_script import DATA_DIR, find_mesh_by_pgram_job, INPUT_MESH_PATH
 import auto_snip_lidar
+import tarp_progress
 
 cc.initCC()
 
@@ -266,6 +267,12 @@ def run_snip_pipeline(json_filepath: str = "input.json") -> None:
 
     print("Starting auto-snip processing...")
 
+    # One SU per annotation; the loop has many early-skip paths, so we count each
+    # annotation as it is reached to keep the dashboard bar advancing monotonically.
+    total = sum(len(job.get("annotations", [])) for job in job_data)
+    done = 0
+    tarp_progress.report(0, total)
+
     for job in job_data:
         top_job     = job["top"]
         bottom_job  = job["bottom"]
@@ -280,6 +287,8 @@ def run_snip_pipeline(json_filepath: str = "input.json") -> None:
 
         if top_id is None or bottom_id is None:
             print(f"Could not find PLY for top={top_job} or bottom={bottom_job}, skipping.")
+            done += len(annotations)
+            tarp_progress.report(done, total)
             continue
 
         print(f"\nProcessing pair: top={top_id}  bottom={bottom_id}")
@@ -288,6 +297,8 @@ def run_snip_pipeline(json_filepath: str = "input.json") -> None:
             top_bin, bottom_bin = find_presnip_bins(top_id, bottom_id)
         except FileNotFoundError as e:
             print(f"  Error: {e}")
+            done += len(annotations)
+            tarp_progress.report(done, total)
             continue
 
         print("  Loading pre-snipped clouds...")
@@ -305,6 +316,8 @@ def run_snip_pipeline(json_filepath: str = "input.json") -> None:
         for annotation_path in annotations:
             ext = os.path.splitext(annotation_path)[1].lower()
             print(f"\n  Processing annotation: {annotation_path}")
+            done += 1
+            tarp_progress.report(done, total, os.path.basename(annotation_path))
 
             # ------------------------------------------------------------------
             # AUTOSNIP: LiDAR USDZ with physically-painted yellow annotation

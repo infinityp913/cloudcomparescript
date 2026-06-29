@@ -9,6 +9,7 @@ import numpy as np
 
 from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project
 import glob
+import tarp_progress
 
 POINT_CLOUD_DIR = "Data"
 
@@ -494,6 +495,8 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
             f"successfully before post-snip. Run from the dashboard, not directly."
         )
 
+    total = len(pairs)
+    tarp_progress.report(0, total)
     for i, (top_cloud_path, bottom_cloud_path) in enumerate(pairs):
         top_base_name = os.path.basename(top_cloud_path).split("_cleaned_su_")[0]
         su_number = top_cloud_path.split("_cleaned_su_")[1].replace(".bin", "")
@@ -522,9 +525,11 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
                 print(f"Successfully finished processing {su_number} and saved project at {project_path}")
             else:
                 print(f"Failed to process {su_number}")
+            tarp_progress.report(i + 1, total, su_number)
 
         except Exception as e:
             print(f"Unexpected error processing {su_number}: {e}")
+            tarp_progress.report(i + 1, total, su_number)
             continue
 
 
