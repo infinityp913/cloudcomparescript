@@ -5,12 +5,7 @@ import scipy
 import requests
 import matplotlib
 import os
-
-import sys as _sys
-json_filepath = _sys.argv[1] if len(_sys.argv) > 1 else "example-17000.json"
-
-with open(json_filepath, "r") as f:
-    job_data = json.load(f)
+import sys
 
 INPUT_MESH_PATH = os.path.expanduser("~/Documents/TARP/ply/")
 DATA_DIR = os.path.expanduser("./Data")
@@ -385,44 +380,43 @@ def find_mesh_by_pgram_job(job_number, mesh_dir=INPUT_MESH_PATH):
     return None
 
 
-if __name__ == "__main__":
-    print("Starting processing...")
+def run_presnip_pipeline(json_filepath: str = "input.json") -> None:
+    """
+    Main entry point for pre-snip processing.
+    Loads PLY meshes, samples them, computes cloud-to-cloud distances,
+    and saves the distance-tagged clouds for use by auto_snip_script.py.
+
+    Callable from any external Python program:
+        import pre_snip_script
+        pre_snip_script.run_presnip_pipeline("input.json")
+    """
+    with open(json_filepath, "r") as f:
+        job_data = json.load(f)
+
+    print("Starting pre-snip processing...")
 
     for job in job_data:
-        top_id = find_mesh_by_pgram_job(job["top"])
+        top_id    = find_mesh_by_pgram_job(job["top"])
         bottom_id = find_mesh_by_pgram_job(job["bottom"])
         print(f"Processing job: Top ID = {top_id}, Bottom ID = {bottom_id}")
-        top_mesh = load_mesh(INPUT_MESH_PATH, top_id)
+        top_mesh    = load_mesh(INPUT_MESH_PATH, top_id)
         bottom_mesh = load_mesh(INPUT_MESH_PATH, bottom_id)
-        top_cloud = sample_mesh(top_mesh)
+        top_cloud    = sample_mesh(top_mesh)
         bottom_cloud = sample_mesh(bottom_mesh)
 
         print(f"Computing distances for {top_id} and {bottom_id}...")
-
         top_with_dist, bottom_with_dist, _ = compute_bidirectional_detailed_distances(
             top_cloud, bottom_cloud
         )
-
         print(f"Computed distances for {top_id} and {bottom_id}.")
 
         output_dir = os.path.join(DATA_DIR, top_id)
         os.makedirs(output_dir, exist_ok=True)
-        save_cloud(output_dir, top_with_dist, f"top_with_dist_for_{bottom_id}")
+        save_cloud(output_dir, top_with_dist,    f"top_with_dist_for_{bottom_id}")
         save_cloud(output_dir, bottom_with_dist, f"bottom_with_dist_for_{top_id}")
 
-        # Uncomment to save the current state as a CloudCompare project
-        # project_name = f"{top_id}/{top_id}_pre_snip.bin"
-        # project_path = os.path.join(DATA_DIR, project_name)
-        # save_project(
-        #     [
-        #         top_mesh,
-        #         bottom_mesh,
-        #         top_cloud,
-        #         bottom_cloud,
-        #         top_with_dist,
-        #         bottom_with_dist,
-        #     ],
-        #     project_path,
-        # )
-
     print("Completed pre-snip processing.")
+
+
+if __name__ == "__main__":
+    run_presnip_pipeline(sys.argv[1] if len(sys.argv) > 1 else "input.json")
