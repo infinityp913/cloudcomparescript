@@ -6,7 +6,7 @@ import requests
 import matplotlib
 import os
 
-json_filepath = "example.json"
+json_filepath = "input.json"
 
 with open(json_filepath, "r") as f:
     job_data = json.load(f)
