@@ -8,49 +8,153 @@ import sys
 import math
 import numpy as np
 
-from pre_snip_script import load_cloud, save_mesh, DATA_DIR, save_project, find_mesh_by_pgram_job
+from pre_snip_script import save_mesh, DATA_DIR, save_project
 import glob
 import tarp_progress
 
+# Windows consoles default to cp1252; keep any stray Unicode in log lines from
+# crashing the run (the dashboard captures stdout, so an encode error aborts it).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
+
 POINT_CLOUD_DIR = "Data"
 
+# Percentile of the Poisson density scalar field below which top-mesh faces are
+# discarded. Poisson on the open top surface extrapolates a low-density "skirt"
+# out to a rectangular boundary past the real SU edge — the boundary operators
+# used to shrink by hand in CloudCompare by tightening the density SF display
+# range on '<su>_top_raw'. Filtering low-density faces collapses it to the true
+# edge automatically. Higher = trims more aggressively; tune per-site if the
+# auto-trim leaves a skirt or eats into the real surface.
+TOP_MESH_DENSITY_MIN_PCT = 20
 
 
-def find_top_bottom_cloud_pairs(point_cloud_dir, top_id, su):
+
+def find_combined_bin(point_cloud_dir, su):
     """
-    Find this SU's snipped bin pair in Data/SU<su>/.
+    Find the operator's combined snip bin for this SU in Data/SU<su>/.
 
-    Pre-snip writes one pair per SU into its own SU folder:
-        Data/SU<su>/SU<su>_<top_id>_top_with_dist_for_<bot_id>.bin
-        Data/SU<su>/SU<su>_<bot_id>_bottom_with_dist_for_<top_id>.bin
-    The operator crops each cloud in CloudCompare and saves over the same file
-    (no rename — the SU folder + card stage already say which SU this is and
-    that snipping is done). Returns (top_path, bottom_path) or (None, None).
-    Picks newest by mtime if duplicates exist (re-crop case). Falls back to the
-    legacy Data/<top_id>/ layout when no SU folder is present.
+    New manual workflow: after snipping the SU in CloudCompare, the operator
+    saves BOTH cropped clouds (top + bottom) into a single project bin in that
+    SU's folder. The filename is flexible — just the SU number with an optional
+    'SU'/'su' prefix, any case — e.g. '20001.bin', 'SU20001.bin', 'su20001.bin'.
+
+    Pre-snip's own '*_with_dist_*.bin' inputs and post-snip's '<su>_post_snip.bin'
+    output are intentionally NOT matched. Returns the bin path (newest by mtime if
+    several match) or None.
     """
     folder = os.path.join(point_cloud_dir, f"SU{su}") if su else None
     if not folder or not os.path.isdir(folder):
-        folder = os.path.join(point_cloud_dir, top_id)  # legacy layout
-    if not os.path.isdir(folder):
         print(f"  Folder not found: {folder}")
+        return None
+
+    # Accept '<su>.bin' with an optional case-insensitive 'su' prefix and nothing
+    # else, so the pre-snip and post-snip bins in the same folder are excluded.
+    name_re = re.compile(rf"^(su)?{re.escape(str(su))}\.bin$", re.IGNORECASE)
+    matches = [
+        p for p in glob.glob(os.path.join(folder, "*.bin"))
+        if name_re.match(os.path.basename(p))
+    ]
+    if not matches:
+        return None
+
+    bin_path = max(matches, key=os.path.getmtime)
+    if len(matches) > 1:
+        print(f"  Multiple combined bins for SU {su}; using newest: {os.path.basename(bin_path)}")
+    return bin_path
+
+
+def _entity_names(entity):
+    """The entity's own name plus its parent group's name (when reachable).
+
+    cloudComPy's importFile usually flattens away the group structure, so the
+    parent name is a best-effort extra signal, not something to rely on.
+    """
+    names = [entity.getName()]
+    try:
+        parent = entity.getParent()
+        if parent is not None:
+            names.append(parent.getName())
+    except Exception:
+        pass
+    return [n for n in names if n]
+
+
+def _pgram_of(entity):
+    """First Pgram_Job_<n> number in the entity (or parent) name, as a string."""
+    for name in _entity_names(entity):
+        m = re.search(r"Pgram_Job_(\d+)", name)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _role_from_name(entity):
+    """'top'/'bottom'/'' from a 'top'/'bottom' marker in the entity/parent name."""
+    joined = " ".join(n.lower() for n in _entity_names(entity))
+    has_top = "top" in joined
+    has_bot = "bottom" in joined
+    if has_top and not has_bot:
+        return "top"
+    if has_bot and not has_top:
+        return "bottom"
+    return ""
+
+
+def load_top_bottom_from_bin(bin_path, top_pgram, bot_pgram):
+    """
+    Load the combined snip bin and return (top_cloud, bottom_cloud).
+
+    The bin holds the two cropped point clouds. We identify which is which by the
+    Pgram_Job_<n> number embedded in each cloud's name, matched against the
+    top/bottom Pgram numbers from input.json (the robust signal, since importFile
+    flattens away the 'top'/'bottom' group names). Fallbacks, in order: a
+    'top'/'bottom' marker still present on the name, then plain file order.
+
+    Returns (top_cloud, bottom_cloud), or (None, None) on failure.
+    """
+    try:
+        imported = cc.importFile(bin_path)
+    except Exception as e:
+        print(f"  Failed to import {os.path.basename(bin_path)}: {e}")
         return None, None
 
-    top_candidates = glob.glob(os.path.join(folder, "*_top_with_dist_*.bin"))
-    bot_candidates = glob.glob(os.path.join(folder, "*_bottom_with_dist_*.bin"))
+    # importFile returns (meshes, clouds); flatten defensively and keep clouds.
+    clouds = []
+    for group in (imported if isinstance(imported, (tuple, list)) else [imported]):
+        for item in (group if isinstance(group, (tuple, list)) else [group]):
+            if item is not None and hasattr(item, "size") and not hasattr(item, "getAssociatedCloud"):
+                clouds.append(item)
 
-    if not top_candidates or not bot_candidates:
+    if len(clouds) < 2:
+        print(f"  Expected 2 point clouds in {os.path.basename(bin_path)}, found {len(clouds)}")
         return None, None
+    if len(clouds) > 2:
+        print(f"  {len(clouds)} clouds in {os.path.basename(bin_path)}; matching top/bottom by Pgram number")
 
-    top_path = max(top_candidates, key=os.path.getmtime)
-    bot_path = max(bot_candidates, key=os.path.getmtime)
+    top_pgram = str(top_pgram).strip()
+    bot_pgram = str(bot_pgram).strip()
 
-    if len(top_candidates) > 1:
-        print(f"  Multiple top bins for SU {su}; using newest: {os.path.basename(top_path)}")
-    if len(bot_candidates) > 1:
-        print(f"  Multiple bottom bins for SU {su}; using newest: {os.path.basename(bot_path)}")
+    # Primary: match by embedded Pgram number (only when top != bottom).
+    if top_pgram and bot_pgram and top_pgram != bot_pgram:
+        top_cloud = next((c for c in clouds if _pgram_of(c) == top_pgram), None)
+        bottom_cloud = next((c for c in clouds if _pgram_of(c) == bot_pgram), None)
+        if top_cloud is not None and bottom_cloud is not None and top_cloud is not bottom_cloud:
+            return top_cloud, bottom_cloud
 
-    return top_path, bot_path
+    # Secondary: 'top'/'bottom' marker on the name (handles top == bottom).
+    top_cloud = next((c for c in clouds if _role_from_name(c) == "top"), None)
+    bottom_cloud = next((c for c in clouds if _role_from_name(c) == "bottom"), None)
+    if top_cloud is not None and bottom_cloud is not None and top_cloud is not bottom_cloud:
+        return top_cloud, bottom_cloud
+
+    # Tertiary: fall back to file order.
+    print("  WARNING: could not identify top/bottom by name; assuming first cloud "
+          "is top, second is bottom.")
+    return clouds[0], clouds[1]
 
 
 def trim_mesh_by_density(mesh, density_min_pct=10):
@@ -74,7 +178,7 @@ def trim_mesh_by_density(mesh, density_min_pct=10):
         print(f"  Density trim: SF='{sf.getName()}' "
               f"range [{sf.getMin():.2f}, {sf.getMax():.2f}]")
 
-        vals = sf.toNpArray()
+        vals = sf.toNpArrayCopy()
         finite = vals[np.isfinite(vals)]
         if len(finite) == 0:
             return mesh
@@ -86,7 +190,7 @@ def trim_mesh_by_density(mesh, density_min_pct=10):
         trimmed = cc.filterBySFValue(threshold, sf_max * 1.01, mesh)
 
         if trimmed is not None and trimmed.size() > 0:
-            print(f"  Density trim: {mesh.size()} → {trimmed.size()} faces")
+            print(f"  Density trim: {mesh.size()} ->{trimmed.size()} faces")
             trimmed.setName(mesh.getName() + "_trimmed")
             return trimmed
         else:
@@ -118,7 +222,7 @@ def filter_by_c2c_distance(cloud, low_percentile=10):
     sf_name = sf.getName()
 
     import numpy as np
-    vals = sf.toNpArray()
+    vals = sf.toNpArrayCopy()
     finite = vals[np.isfinite(vals)]
     if len(finite) == 0:
         print(f"  C2C filter: all values non-finite on {cloud.getName()}, skipping")
@@ -135,31 +239,21 @@ def filter_by_c2c_distance(cloud, low_percentile=10):
         return cloud
 
     filtered.setName(cloud.getName() + "_c2c_filtered")
-    print(f"  C2C filter: {cloud.size()} → {filtered.size()} pts")
+    print(f"  C2C filter: {cloud.size()} ->{filtered.size()} pts")
     return filtered
 
 
-def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path, su_number, top_base_name, bottom_base_name):
-    print(f"Loading point clouds for {top_base_name} and {bottom_base_name}...")
+def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
+    print(f"Processing snipped clouds for SU {su_number}...")
 
-    # Load clouds with error checking
-    try:
-        print(f"Loading file {bottom_cloud_path}")
-        top_cloud = load_cloud(f"{top_cloud_path}", label=f"{top_base_name}_top")
-        if top_cloud is None:
-            raise ValueError(f"Failed to load top cloud: {top_base_name}")
-        print(f"Top cloud loaded: {top_cloud.size()} points")
-
-        bottom_cloud = load_cloud(
-            f"{bottom_cloud_path}", label=f"{bottom_base_name}_bottom"
-        )
-        if bottom_cloud is None:
-            raise ValueError(f"Failed to load bottom cloud: {bottom_base_name}")
-        print(f"Bottom cloud loaded: {bottom_cloud.size()} points")
-
-    except Exception as e:
-        print(f"Error loading clouds: {e}")
+    if top_cloud is None or bottom_cloud is None:
+        print("Error: missing top or bottom cloud")
         return None, None, None
+
+    top_cloud.setName(f"SU{su_number}_top")
+    bottom_cloud.setName(f"SU{su_number}_bottom")
+    print(f"Top cloud: {top_cloud.size()} points; "
+          f"Bottom cloud: {bottom_cloud.size()} points")
 
     # Filter out low-C2C-distance fringe points that cause Poisson bubble artifacts
     top_cloud    = filter_by_c2c_distance(top_cloud,    low_percentile=25)
@@ -175,7 +269,7 @@ def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path, su_number, to
         cc.computeNormals([bottom_cloud])
 
     # Invert the normals of the bottom cloud
-    print(f"Inverting normals for bottom cloud of {bottom_base_name}...")
+    print(f"Inverting normals for bottom cloud of SU{su_number}...")
     try:
         cc.invertNormals([bottom_cloud])
     except Exception as e:
@@ -199,6 +293,8 @@ def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path, su_number, to
         return merged_cloud, None, None
 
     # Poisson surface reconstruction with error handling
+    merged_mesh = None
+    top_mesh = None
     print("Starting Poisson reconstruction for merged cloud...")
     try:
         # Try with lower depth first to avoid memory issues
@@ -233,6 +329,22 @@ def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path, su_number, to
             print("Error: Failed to create mesh")
     except Exception as e:
         print(f"Error during Poisson reconstruction for top cloud: {e}")
+
+    # Trim the phantom Poisson skirt off the top mesh the same way the merged
+    # mesh is trimmed above. This replaces the manual CloudCompare step where the
+    # operator opens '<su>_post_snip.bin', selects '<su>_top_raw' and shrinks its
+    # rectangular boundary by adjusting the density SF display range. The raw mesh
+    # is kept in the project bin so that manual fallback is still possible.
+    top_mesh_trimmed = top_mesh
+    if top_mesh is not None:
+        try:
+            top_mesh_trimmed = trim_mesh_by_density(
+                top_mesh, density_min_pct=TOP_MESH_DENSITY_MIN_PCT)
+            if top_mesh_trimmed is not top_mesh:
+                top_mesh_trimmed.setName(f"{su_number}_top_trimmed")
+        except Exception as e:
+            print(f"  Top mesh density trim failed ({e}) — using raw top mesh")
+            top_mesh_trimmed = top_mesh
 
     # # filter the top cloud by density and run poisson reconstruction on it
     # if top_cloud is not None:
@@ -334,33 +446,32 @@ def merge_clouds_and_build_mesh(top_cloud_path, bottom_cloud_path, su_number, to
         except Exception as e:
             print(f"Error computing volume for merged mesh: {e}")
 
-        save_merged_mesh_and_top_mesh(
-            su_number, top_base_name, merged_mesh, top_mesh
-        )
+        # Save the trimmed top mesh as the SU Top OBJ that QGIS reads.
+        save_merged_mesh_and_top_mesh(su_number, merged_mesh, top_mesh_trimmed)
 
         return (
             merged_cloud,
             top_cloud,
             bottom_cloud,
             merged_mesh,
-            top_mesh,
-            # top_mesh_filtered,
+            top_mesh_trimmed,
+            top_mesh,  # raw, untrimmed — kept in the project bin for manual fallback
         )
 
 
-def save_merged_mesh_and_top_mesh(
-    su_number, top_base_name, merged_mesh, top_mesh
-):
+def save_merged_mesh_and_top_mesh(su_number, merged_mesh, top_mesh):
     """Save the merged mesh and top mesh to the specified directory.
     Args:
         su_number (str): The identifier for the surface; also names the per-SU
             working folder Data/SU<su_number>/ where the top mesh is written.
-        top_base_name (str): The top cloud's full Pgram+SU stem (kept for logging).
         merged_mesh (cc.Mesh): The merged mesh to save.
         top_mesh (cc.Mesh): The top mesh to save.
     """
-    # Save merged mesh
+    # Save merged mesh. cc.SaveMesh does not create the target directory and
+    # fails silently if it's missing, so ensure it exists first (the dashboard
+    # detects post-snip completion by this OBJ in Data/Final_Volumes/).
     try:
+        os.makedirs(f"{POINT_CLOUD_DIR}/Final_Volumes", exist_ok=True)
         save_mesh(
             f"{POINT_CLOUD_DIR}/Final_Volumes", merged_mesh, file_name=f"SU_{su_number}_raw"
         )
@@ -370,16 +481,20 @@ def save_merged_mesh_and_top_mesh(
     except Exception as e:
         print(f"Error saving mesh: {e}")
 
-    # Save top mesh into this SU's working folder
+    # Save the top mesh where the Create-SU-Sheet QGIS script (generate_su_sheets.py)
+    # reads it: <base>/Volumetrics_<year>/SU Top OBJs/SU_<su>_top.obj. The dashboard
+    # passes that resolved directory via TARP_SU_TOP_OBJ_DIR (built from base_path +
+    # season_year in config.yaml); when this script is run standalone, fall back to a
+    # local 'SU Top OBJs' folder so the run still succeeds.
+    su_top_obj_dir = os.environ.get("TARP_SU_TOP_OBJ_DIR") or f"{POINT_CLOUD_DIR}/SU Top OBJs"
     try:
-        save_mesh(
-            f"{POINT_CLOUD_DIR}/SU{su_number}",
+        os.makedirs(su_top_obj_dir, exist_ok=True)
+        save_path = save_mesh(
+            su_top_obj_dir,
             top_mesh,
-            file_name=f"SU_{su_number}_top_raw",
+            file_name=f"SU_{su_number}_top",
         )
-        print(
-            f"Top mesh saved for {su_number} at {POINT_CLOUD_DIR}/SU{su_number}/SU_{su_number}_top_raw.obj"
-        )
+        print(f"Top mesh saved for {su_number} at {save_path}")
     except Exception as e:
         print(f"Error saving top mesh: {e}")
 
@@ -403,33 +518,44 @@ def save_merged_mesh_and_top_mesh(
 
 def update_volume_measurements(volume_file, su_number, volume_3d, volume_25d, isWarning):
     notes = "There might be a hole in the mesh" if isWarning else "No issues detected"
-    new_line = f"SU{su_number}\t{volume_3d}\t{volume_25d}\t{notes}.\n"
+    # The first column is written as "SU<su>", so match on the same key — otherwise
+    # every re-run appends a duplicate instead of updating the existing row.
+    key = f"SU{su_number}"
+    new_line = f"{key}\t{volume_3d}\t{volume_25d}\t{notes}.\n"
 
-    # Read all lines and check if su_number exists
     lines = []
-    found = False
     if os.path.exists(volume_file):
         with open(volume_file, "r") as vol_file:
             lines = vol_file.readlines()
-        for idx, line in enumerate(lines):
-            if line.split("\t", 1)[0] == su_number:
-                lines[idx] = new_line
-                found = True
-                break
 
+    # Replace the first existing row for this SU in place, drop any later
+    # duplicates, and append if the SU isn't present yet.
+    out = []
+    found = False
+    for line in lines:
+        if line.split("\t", 1)[0] == key:
+            if not found:
+                out.append(new_line)
+                found = True
+            # else: drop duplicate row for this SU
+        else:
+            out.append(line)
     if not found:
-        lines.append(new_line)
+        out.append(new_line)
 
     with open(volume_file, "w") as vol_file:
-        vol_file.writelines(lines)
+        vol_file.writelines(out)
 
 
 def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
     """
-    Main entry point for post-snip processing. Input-json-driven: reads top/bottom/su
-    from input.json, resolves the PLY stems via find_mesh_by_pgram_job, then globs
-    Data/<top_id>/ for this SU's SU<su>_ bin pair, which the operator has cropped in
-    CloudCompare and saved over the same files.
+    Main entry point for post-snip processing. Input-json-driven: reads su (plus
+    top/bottom Pgram numbers) from input.json, finds each SU's combined snip bin
+    in Data/SU<su>/, identifies the top and bottom clouds inside it, then merges
+    them and builds the volume mesh.
+
+    The operator manually snips each SU in CloudCompare and saves BOTH cropped
+    clouds into one project bin named '<su>.bin' (or 'SU<su>.bin', any case).
 
     Callable from any external Python program:
         import post_snip_script
@@ -442,51 +568,50 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
     total = len(job_data)
     tarp_progress.report(0, total)
     for i, entry in enumerate(job_data):
-        top_pgram = entry.get("top", "")
-        bot_pgram = entry.get("bottom", "")
+        top_pgram = str(entry.get("top", ""))
+        bot_pgram = str(entry.get("bottom", ""))
         su = str(entry.get("su", ""))
-        if su and not re.match(r'^[\w\-]+$', su):
-            print(f"  Entry {i}: invalid su value {su!r} (must be alphanumeric/hyphen/underscore), skipping")
-            tarp_progress.report(i + 1, total, su)
-            continue
-
-        top_id = find_mesh_by_pgram_job(top_pgram)
-        bot_id = find_mesh_by_pgram_job(bot_pgram)
-
-        if not top_id or not bot_id:
-            print(f"  SU {su or '?'}: could not resolve PLY stem for top={top_pgram!r} or bottom={bot_pgram!r}, skipping")
+        if not su or not re.match(r'^[\w\-]+$', su):
+            print(f"  Entry {i}: invalid or missing su value {su!r} "
+                  f"(must be alphanumeric/hyphen/underscore), skipping")
             tarp_progress.report(i + 1, total, su or '?')
             continue
 
-        # Fallback: parse su from the top_id stem when the JSON entry lacks it
-        if not su:
-            parts = top_id.split("_SU_")
-            su = parts[1].split("_")[0] if len(parts) > 1 else ""
-
-        top_path, bot_path = find_top_bottom_cloud_pairs(POINT_CLOUD_DIR, top_id, su)
-        if not top_path or not bot_path:
+        bin_path = find_combined_bin(POINT_CLOUD_DIR, su)
+        if not bin_path:
             print(
-                f"  SU {su}: no bin pair found in {POINT_CLOUD_DIR}/SU{su}/. "
-                f"Open this SU's pre-snip bins in CC, crop top & bottom, and save over "
-                f"the same files (no rename needed)."
+                f"  SU {su}: no combined snip bin found in {POINT_CLOUD_DIR}/SU{su}/. "
+                f"Snip the SU in CloudCompare and save both cropped clouds as "
+                f"'{su}.bin' (or 'SU{su}.bin') in that folder."
+            )
+            tarp_progress.report(i + 1, total, su)
+            continue
+
+        top_cloud, bottom_cloud = load_top_bottom_from_bin(bin_path, top_pgram, bot_pgram)
+        if top_cloud is None or bottom_cloud is None:
+            print(
+                f"  SU {su}: could not load a top+bottom cloud pair from "
+                f"{os.path.basename(bin_path)} (expected two point clouds)."
             )
             tarp_progress.report(i + 1, total, su)
             continue
 
         print(
             f"\n=== Processing pair {i + 1}/{len(job_data)}: SU {su} ==="
-            f"\nTop:    {top_path}\nBottom: {bot_path}\n"
+            f"\nBin: {bin_path}\n"
         )
 
         try:
-            result = merge_clouds_and_build_mesh(top_path, bot_path, su, top_id, bot_id)
-            if result and result[0] is not None and result[3] is not None:
-                merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh = result
+            result = merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su)
+            if result and len(result) >= 4 and result[0] is not None and result[3] is not None:
+                merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh, top_mesh_raw = result
                 project_path = os.path.join(DATA_DIR, f"SU{su}", f"{su}_post_snip.bin")
-                save_project(
-                    [merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh],
-                    project_path,
-                )
+                entities = [merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh]
+                # Keep the raw, untrimmed top mesh in the bin too (manual fallback),
+                # but only when the trim actually produced a distinct mesh.
+                if top_mesh_raw is not None and top_mesh_raw is not top_mesh:
+                    entities.append(top_mesh_raw)
+                save_project(entities, project_path)
                 print(f"Successfully finished processing SU {su} and saved project at {project_path}")
                 produced += 1
             else:
@@ -500,9 +625,9 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
 
     if produced == 0 and job_data:
         raise RuntimeError(
-            "No snipped clouds found for any SU in this run. Open each SU's pre-snip "
-            "bins (Open in CC), crop top & bottom, and save over the same SU<su>_ files "
-            "in the `Data/<Pgram_Job_...>` folder before running post-snip."
+            "No combined snip bins found for any SU in this run. For each SU, snip "
+            "the top and bottom clouds in CloudCompare and save BOTH into a single "
+            "project bin named '<su>.bin' (or 'SU<su>.bin') inside Data/SU<su>/."
         )
 
 

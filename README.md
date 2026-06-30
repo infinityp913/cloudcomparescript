@@ -9,8 +9,8 @@ Part of the **[Tharros Archaeological Research Project (TARP)](https://air.ht.lu
 The pipeline processes paired top and bottom 3D models (PLY files) representing archaeological layers to compute the volume of material between them.
 
 1. **Pre-snip** (`pre_snip_script.py`): Loads PLY meshes, samples them to point clouds, computes bidirectional cloud-to-cloud (C2C) distances, and saves one `.bin` pair per SU (prefixed `SU<su>_`) with distance scalar fields.
-2. **Manual crop** (CloudCompare): The operator opens the SU's pre-snip bin pair in CloudCompare, crops top and bottom to the SU boundary, and saves over the same files (no rename — the `SU<su>_` prefix already identifies the pair). Auto-snip (`auto_snip_script.py`) is available but disabled in the dashboard.
-3. **Post-snip** (`post_snip_script.py`): Reads `input.json`, resolves PLY stems, finds each SU's `SU<su>_` bin pair, merges them, runs Poisson surface reconstruction, and computes 3D and 2.5D volumes.
+2. **Manual snip** (CloudCompare): The operator opens the SU's pre-snip bin pair in CloudCompare, crops top and bottom to the SU boundary, and saves **both** cropped clouds into a single project bin named `<su>.bin` (e.g. `20001.bin`) in `Data/SU<su>/`. Auto-snip (`auto_snip_script.py`) is available but disabled in the dashboard.
+3. **Post-snip** (`post_snip_script.py`): Reads `input.json`, finds each SU's combined `<su>.bin`, identifies the top and bottom clouds inside it (by the `Pgram_Job_<n>` number in each cloud's name, matched to `input.json`), merges them, runs Poisson surface reconstruction, and computes 3D and 2.5D volumes.
 
 ## Project Structure
 
@@ -130,14 +130,13 @@ Edit `input.json` for the SU you're processing:
 
 Loads paired PLY meshes, samples them to point clouds, computes bidirectional C2C distances, and saves one pair per SU, `SU<su>_*_top_with_dist_*.bin` and `SU<su>_*_bottom_with_dist_*.bin`, in `Data/SU<su>/`.
 
-### Step 3: Manually Crop in CloudCompare
+### Step 3: Manually Snip in CloudCompare
 
-After pre-snip, open the SU's bin pair in CloudCompare (use the **Open in CC** button in the dashboard), crop both clouds to the SU boundary, and **save over the same files** in `Data/SU<su>/` — no rename needed:
+After pre-snip, open the SU's bin pair in CloudCompare (use the **Open in CC** button in the dashboard) and crop both the top and bottom clouds to the SU boundary. Then save **both** cropped clouds together into a **single project bin** in `Data/SU<su>/`:
 
-- Top crop:    `SU<su>_<top_id>_top_with_dist_for_<bot_id>.bin`
-- Bottom crop: `SU<su>_<bot_id>_bottom_with_dist_for_<top_id>.bin`
+- `Data/SU<su>/<su>.bin` — e.g. `Data/SU20001/20001.bin`
 
-The `SU<su>_` prefix identifies each SU's pair, so post-snip picks the right one automatically even when several SUs share a top folder. (Tip: clone the cloud in CloudCompare, crop the clone, save over the file, then delete the clone — so a mis-crop doesn't lose the original mid-session.) If you re-crop, just save again — the newest file by modification time is used.
+The filename is flexible: the SU number with an optional `SU`/`su` prefix, in any case — `20001.bin`, `SU20001.bin`, and `su20001.bin` are all accepted. (Select both cropped clouds in the DB tree → *File ▸ Save* → name it `<su>.bin`.) Post-snip identifies which cloud is top vs bottom from the `Pgram_Job_<n>` number in each cloud's name (matched against `top`/`bottom` in `input.json`), so the `top`/`bottom` group labels don't need to be preserved. If you re-snip, just save again — the newest matching bin by modification time is used.
 
 > **Auto-snip** (`auto_snip_script.py`) is still available for USDZ LiDAR or annotated ortho PNG workflows but is disabled in the dashboard. See `CLAUDE.md` for details.
 
@@ -147,7 +146,9 @@ The `SU<su>_` prefix identifies each SU's pair, so post-snip picks the right one
 ./run.sh post_snip_script.py input.json
 ```
 
-For each SU's cropped pair in `Data/SU<su>/`:
+For each SU's combined `<su>.bin` in `Data/SU<su>/`:
+- Loads the bin and identifies the top and bottom clouds by Pgram number
+- Filters out low-C2C-distance fringe points (p25) that cause Poisson bubble artifacts
 - Computes normals (inverts bottom cloud normals to point inward)
 - Merges top and bottom clouds
 - Runs Poisson surface reconstruction (depth=11) with density trimming at p10 (removes phantom boundary faces)
@@ -161,8 +162,10 @@ For each SU's cropped pair in `Data/SU<su>/`:
 
 | File | Description |
 |------|-------------|
-| `Data/SU<su>/SU<su>_*_top_with_dist_for_*.bin` | Top cloud — pre-snip output, then cropped in place by the operator |
-| `Data/SU<su>/SU<su>_*_bottom_with_dist_for_*.bin` | Bottom cloud — pre-snip output, then cropped in place by the operator |
+| `Data/SU<su>/SU<su>_*_top_with_dist_for_*.bin` | Top cloud — pre-snip output, opened by the operator for snipping |
+| `Data/SU<su>/SU<su>_*_bottom_with_dist_for_*.bin` | Bottom cloud — pre-snip output, opened by the operator for snipping |
+| `Data/SU<su>/<su>.bin` | Combined snip — both cropped clouds, saved by the operator (post-snip input) |
+| `Data/SU<su>/<su>_post_snip.bin` | Post-snip project: merged + top/bottom clouds and meshes |
 | `Data/Final_Volumes/SU_<su>_raw.obj` | Merged Poisson mesh for volume calculation |
 | `Data/SU<su>/SU_<su>_top_raw.obj` | Top surface mesh |
 | `volume_measures.txt` | Tab-separated: SU name, 3D volume (cm³), 2.5D volume (m³), warnings |
