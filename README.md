@@ -8,9 +8,9 @@ Part of the **[Tharros Archaeological Research Project (TARP)](https://air.ht.lu
 
 The pipeline processes paired top and bottom 3D models (PLY files) representing archaeological layers to compute the volume of material between them.
 
-1. **Pre-snip** (`pre_snip_script.py`): Loads PLY meshes, samples them to point clouds, computes bidirectional cloud-to-cloud (C2C) distances, and saves `.bin` files with distance scalar fields.
-2. **Manual crop** (CloudCompare): The operator opens the pre-snip bin pair in CloudCompare, crops top and bottom to the SU boundary, and saves each result with a `_snipped` suffix in the same folder. Auto-snip (`auto_snip_script.py`) is available but disabled in the dashboard.
-3. **Post-snip** (`post_snip_script.py`): Reads `input.json`, resolves PLY stems, finds the manually-snipped `*_snipped.bin` pairs, merges them, runs Poisson surface reconstruction, and computes 3D and 2.5D volumes.
+1. **Pre-snip** (`pre_snip_script.py`): Loads PLY meshes, samples them to point clouds, computes bidirectional cloud-to-cloud (C2C) distances, and saves one `.bin` pair per SU (prefixed `SU<su>_`) with distance scalar fields.
+2. **Manual crop** (CloudCompare): The operator opens the SU's pre-snip bin pair in CloudCompare, crops top and bottom to the SU boundary, and saves over the same files (no rename — the `SU<su>_` prefix already identifies the pair). Auto-snip (`auto_snip_script.py`) is available but disabled in the dashboard.
+3. **Post-snip** (`post_snip_script.py`): Reads `input.json`, resolves PLY stems, finds each SU's `SU<su>_` bin pair, merges them, runs Poisson surface reconstruction, and computes 3D and 2.5D volumes.
 
 ## Project Structure
 
@@ -116,8 +116,8 @@ Edit `input.json` for the SU you're processing:
 ]
 ```
 
-- `"top"` / `"bottom"`: Pgram job numbers matching PLY filenames and `Data/<top_id>/` folders.
-- `"su"`: SU identifier (may be a range like `"22044-22048"`). Used by post_snip to name output meshes. Written automatically by the dashboard; add manually when running scripts directly.
+- `"top"` / `"bottom"`: Pgram job numbers matching PLY filenames.
+- `"su"`: SU identifier (may be a range like `"22044-22048"`). Names the per-SU output folder `Data/SU<su>/` and the output meshes. Written automatically by the dashboard; add manually when running scripts directly.
 - `"annotations"` (auto_snip only): list of annotation file paths — mode is inferred from extension:
   - `.usdz` → autosnip (iPhone LiDAR scan with yellow-painted annotation)
   - `.png` → manual snip (annotated PLY ortho with black stroke outline)
@@ -128,16 +128,16 @@ Edit `input.json` for the SU you're processing:
 ./run.sh pre_snip_script.py input.json
 ```
 
-Loads paired PLY meshes, samples them to point clouds, computes bidirectional C2C distances, and saves `*_top_with_dist_*.bin` and `*_bottom_with_dist_*.bin` in `Data/<top_job_folder>/`.
+Loads paired PLY meshes, samples them to point clouds, computes bidirectional C2C distances, and saves one pair per SU, `SU<su>_*_top_with_dist_*.bin` and `SU<su>_*_bottom_with_dist_*.bin`, in `Data/SU<su>/`.
 
 ### Step 3: Manually Crop in CloudCompare
 
-After pre-snip, open the bin pair in CloudCompare (use the **Open in CC** button in the dashboard), crop both clouds to the SU boundary, and **Save As** each with a `_snipped` suffix in the same `Data/<top_id>/` folder:
+After pre-snip, open the SU's bin pair in CloudCompare (use the **Open in CC** button in the dashboard), crop both clouds to the SU boundary, and **save over the same files** in `Data/SU<su>/` — no rename needed:
 
-- Top crop:    `<top_id>_top_with_dist_for_<bot_id>_snipped.bin`
-- Bottom crop: `<bot_id>_bottom_with_dist_for_<top_id>_snipped.bin`
+- Top crop:    `SU<su>_<top_id>_top_with_dist_for_<bot_id>.bin`
+- Bottom crop: `SU<su>_<bot_id>_bottom_with_dist_for_<top_id>.bin`
 
-Post-snip picks these up automatically. If you re-crop, just Save As again — the newest file by modification time is used.
+The `SU<su>_` prefix identifies each SU's pair, so post-snip picks the right one automatically even when several SUs share a top folder. (Tip: clone the cloud in CloudCompare, crop the clone, save over the file, then delete the clone — so a mis-crop doesn't lose the original mid-session.) If you re-crop, just save again — the newest file by modification time is used.
 
 > **Auto-snip** (`auto_snip_script.py`) is still available for USDZ LiDAR or annotated ortho PNG workflows but is disabled in the dashboard. See `CLAUDE.md` for details.
 
@@ -147,13 +147,13 @@ Post-snip picks these up automatically. If you re-crop, just Save As again — t
 ./run.sh post_snip_script.py input.json
 ```
 
-For each matched `*_snipped.bin` pair in `Data/<top_id>/`:
+For each SU's cropped pair in `Data/SU<su>/`:
 - Computes normals (inverts bottom cloud normals to point inward)
 - Merges top and bottom clouds
 - Runs Poisson surface reconstruction (depth=11) with density trimming at p10 (removes phantom boundary faces)
 - Computes 3D mesh volume in cm³ and 2.5D projected volume in m³
 - Appends to `volume_measures.txt`
-- Saves `Data/Final_Volumes/SU_<N>_raw.obj` and `Data/<top_folder>/SU_<N>_top_raw.obj`
+- Saves `Data/Final_Volumes/SU_<N>_raw.obj` and `Data/SU<N>/SU_<N>_top_raw.obj`
 
 ---
 
@@ -161,10 +161,10 @@ For each matched `*_snipped.bin` pair in `Data/<top_id>/`:
 
 | File | Description |
 |------|-------------|
-| `Data/<top_id>/*_top_with_dist_for_*_snipped.bin` | Manually-cropped top cloud (operator saves from CC) |
-| `Data/<top_id>/*_bottom_with_dist_for_*_snipped.bin` | Manually-cropped bottom cloud (operator saves from CC) |
+| `Data/SU<su>/SU<su>_*_top_with_dist_for_*.bin` | Top cloud — pre-snip output, then cropped in place by the operator |
+| `Data/SU<su>/SU<su>_*_bottom_with_dist_for_*.bin` | Bottom cloud — pre-snip output, then cropped in place by the operator |
 | `Data/Final_Volumes/SU_<su>_raw.obj` | Merged Poisson mesh for volume calculation |
-| `Data/<top_id>/SU_<su>_top_raw.obj` | Top surface mesh |
+| `Data/SU<su>/SU_<su>_top_raw.obj` | Top surface mesh |
 | `volume_measures.txt` | Tab-separated: SU name, 3D volume (cm³), 2.5D volume (m³), warnings |
 | `Data/<top_id>/debug_topdown_render.png` | Top-down PLY render used for alignment (auto_snip) |
 | `Data/<top_id>/debug_SU<N>_{method}_lidar_vs_result.png` | LiDAR vs PLY comparison per method (auto_snip) |

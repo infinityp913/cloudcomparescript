@@ -16,19 +16,28 @@ POINT_CLOUD_DIR = "Data"
 
 
 
-def find_top_bottom_cloud_pairs(point_cloud_dir, top_id):
+def find_top_bottom_cloud_pairs(point_cloud_dir, top_id, su):
     """
-    Find the manually-snipped bin pair for one SU in Data/<top_id>/.
-    Returns (top_path, bottom_path) or (None, None) if not found.
-    Picks newest by mtime when multiple candidates exist (re-crop case).
+    Find this SU's snipped bin pair in Data/SU<su>/.
+
+    Pre-snip writes one pair per SU into its own SU folder:
+        Data/SU<su>/SU<su>_<top_id>_top_with_dist_for_<bot_id>.bin
+        Data/SU<su>/SU<su>_<bot_id>_bottom_with_dist_for_<top_id>.bin
+    The operator crops each cloud in CloudCompare and saves over the same file
+    (no rename — the SU folder + card stage already say which SU this is and
+    that snipping is done). Returns (top_path, bottom_path) or (None, None).
+    Picks newest by mtime if duplicates exist (re-crop case). Falls back to the
+    legacy Data/<top_id>/ layout when no SU folder is present.
     """
-    folder = os.path.join(point_cloud_dir, top_id)
+    folder = os.path.join(point_cloud_dir, f"SU{su}") if su else None
+    if not folder or not os.path.isdir(folder):
+        folder = os.path.join(point_cloud_dir, top_id)  # legacy layout
     if not os.path.isdir(folder):
         print(f"  Folder not found: {folder}")
         return None, None
 
-    top_candidates = glob.glob(os.path.join(folder, "*_top_with_dist_*_snipped.bin"))
-    bot_candidates = glob.glob(os.path.join(folder, "*_bottom_with_dist_*_snipped.bin"))
+    top_candidates = glob.glob(os.path.join(folder, "*_top_with_dist_*.bin"))
+    bot_candidates = glob.glob(os.path.join(folder, "*_bottom_with_dist_*.bin"))
 
     if not top_candidates or not bot_candidates:
         return None, None
@@ -37,9 +46,9 @@ def find_top_bottom_cloud_pairs(point_cloud_dir, top_id):
     bot_path = max(bot_candidates, key=os.path.getmtime)
 
     if len(top_candidates) > 1:
-        print(f"  Multiple _snipped top bins; using newest: {os.path.basename(top_path)}")
+        print(f"  Multiple top bins for SU {su}; using newest: {os.path.basename(top_path)}")
     if len(bot_candidates) > 1:
-        print(f"  Multiple _snipped bottom bins; using newest: {os.path.basename(bot_path)}")
+        print(f"  Multiple bottom bins for SU {su}; using newest: {os.path.basename(bot_path)}")
 
     return top_path, bot_path
 
@@ -344,8 +353,9 @@ def save_merged_mesh_and_top_mesh(
 ):
     """Save the merged mesh and top mesh to the specified directory.
     Args:
-        su_number (str): The identifier for the surface.
-        top_base_name (str): The base name for the top mesh. This is used to save the meshes in the right folder named after the top cloud's full Pgram+SU name.
+        su_number (str): The identifier for the surface; also names the per-SU
+            working folder Data/SU<su_number>/ where the top mesh is written.
+        top_base_name (str): The top cloud's full Pgram+SU stem (kept for logging).
         merged_mesh (cc.Mesh): The merged mesh to save.
         top_mesh (cc.Mesh): The top mesh to save.
     """
@@ -360,15 +370,15 @@ def save_merged_mesh_and_top_mesh(
     except Exception as e:
         print(f"Error saving mesh: {e}")
 
-    # Save top mesh
+    # Save top mesh into this SU's working folder
     try:
         save_mesh(
-            f"{POINT_CLOUD_DIR}/{top_base_name}",
+            f"{POINT_CLOUD_DIR}/SU{su_number}",
             top_mesh,
             file_name=f"SU_{su_number}_top_raw",
         )
         print(
-            f"Top mesh saved for {su_number} at {POINT_CLOUD_DIR}/{top_base_name}/SU_{su_number}_top_raw.obj"
+            f"Top mesh saved for {su_number} at {POINT_CLOUD_DIR}/SU{su_number}/SU_{su_number}_top_raw.obj"
         )
     except Exception as e:
         print(f"Error saving top mesh: {e}")
@@ -418,8 +428,8 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
     """
     Main entry point for post-snip processing. Input-json-driven: reads top/bottom/su
     from input.json, resolves the PLY stems via find_mesh_by_pgram_job, then globs
-    Data/<top_id>/ for manually-snipped *_snipped.bin pairs saved by the operator
-    after cropping in CloudCompare.
+    Data/<top_id>/ for this SU's SU<su>_ bin pair, which the operator has cropped in
+    CloudCompare and saved over the same files.
 
     Callable from any external Python program:
         import post_snip_script
@@ -453,12 +463,12 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
             parts = top_id.split("_SU_")
             su = parts[1].split("_")[0] if len(parts) > 1 else ""
 
-        top_path, bot_path = find_top_bottom_cloud_pairs(POINT_CLOUD_DIR, top_id)
+        top_path, bot_path = find_top_bottom_cloud_pairs(POINT_CLOUD_DIR, top_id, su)
         if not top_path or not bot_path:
             print(
-                f"  SU {su}: no manually-snipped bins found in {POINT_CLOUD_DIR}/{top_id}/. "
-                f"Open the pre-snip bins in CC, crop top & bottom, and Save As with a "
-                f"`_snipped` suffix in the same folder."
+                f"  SU {su}: no bin pair found in {POINT_CLOUD_DIR}/SU{su}/. "
+                f"Open this SU's pre-snip bins in CC, crop top & bottom, and save over "
+                f"the same files (no rename needed)."
             )
             tarp_progress.report(i + 1, total, su)
             continue
@@ -472,7 +482,7 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
             result = merge_clouds_and_build_mesh(top_path, bot_path, su, top_id, bot_id)
             if result and result[0] is not None and result[3] is not None:
                 merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh = result
-                project_path = os.path.join(DATA_DIR, top_id, f"{su}_post_snip.bin")
+                project_path = os.path.join(DATA_DIR, f"SU{su}", f"{su}_post_snip.bin")
                 save_project(
                     [merged_cloud, top_cloud, bottom_cloud, merged_mesh, top_mesh],
                     project_path,
@@ -490,10 +500,9 @@ def run_postsnip_pipeline(json_filepath: str = "input.json") -> None:
 
     if produced == 0 and job_data:
         raise RuntimeError(
-            "No manually-snipped clouds found for any SU in this run. "
-            "Open each SU's pre-snip bins (Open in CC), crop top & bottom, and Save As "
-            "with a `_snipped` suffix in the same `Data/<Pgram_Job_...>` folder before "
-            "running post-snip."
+            "No snipped clouds found for any SU in this run. Open each SU's pre-snip "
+            "bins (Open in CC), crop top & bottom, and save over the same SU<su>_ files "
+            "in the `Data/<Pgram_Job_...>` folder before running post-snip."
         )
 
 

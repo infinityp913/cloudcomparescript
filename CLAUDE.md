@@ -9,9 +9,9 @@
 
 Automates the "snipping" step in the TARP archaeology volume pipeline:
 
-1. **pre_snip_script.py** — loads two PLY photogrammetry clouds (top + bottom of a stratigraphic unit), computes cloud-to-cloud distances, and saves the tagged clouds as `*_top_with_dist_for_<bottom_id>.bin` / `*_bottom_with_dist_for_<top_id>.bin` in `Data/<top_id>/`.
+1. **pre_snip_script.py** — loads two PLY photogrammetry clouds (top + bottom of a stratigraphic unit), computes cloud-to-cloud distances, and saves one tagged-cloud pair per SU as `SU<su>_<top_id>_top_with_dist_for_<bottom_id>.bin` / `SU<su>_<bottom_id>_bottom_with_dist_for_<top_id>.bin` in `Data/SU<su>/`.
 2. **auto_snip_script.py** — given either a USDZ iPhone LiDAR scan (autosnip) or a hand-annotated ortho PNG (manual snip), locates the annotation in the PLY world frame and crops both clouds to that region. **Disabled in the dashboard** (unreliable); the lab snips manually in CloudCompare instead.
-3. **post_snip_script.py** — input.json-driven: resolves PLY stems from `top`/`bottom` pgram numbers, finds manually-snipped `*_snipped.bin` pairs in `Data/<top_id>/`, merges them, runs Poisson reconstruction, and computes volumes.
+3. **post_snip_script.py** — input.json-driven: resolves PLY stems from `top`/`bottom` pgram numbers, finds each SU's cropped bin pair in `Data/SU<su>/`, merges them, runs Poisson reconstruction, and computes volumes.
 
 ---
 
@@ -52,7 +52,7 @@ Written by the dashboard (`volume_runner._write_input_json`) before each script 
 ]
 ```
 
-- `top` / `bottom`: Pgram job numbers used to locate the `.ply` files under `~/Documents/TARP/ply/` and the `Data/<top_id>/` bin folder.
+- `top` / `bottom`: Pgram job numbers used to locate the `.ply` files under `~/Documents/TARP/ply/`. `su` names the per-SU output folder `Data/SU<su>/`.
 - `su`: SU identifier from the kanban card (may be a range like `"22044-22048"`). Used by post_snip to name `SU_<su>_raw.obj`; also passed through for pre_snip (ignored) and auto_snip.
 - `annotations` (auto_snip only): list of annotation file paths. Mode is inferred from extension:
   - `.usdz` → **autosnip** (LiDAR scan with yellow-painted annotation)
@@ -110,13 +110,11 @@ Evaluated across 4 sites (20002, 20003, 20005, 21001) using GT from annotated or
 
 ```
 Data/
-  <top_id>/                         # e.g. Pgram_Job_786_SU_20002_...
-    *_top_with_dist_for_<bot_id>.bin      # pre_snip output (top cloud + C2C distances)
-    *_bottom_with_dist_for_<top_id>.bin   # pre_snip output (bottom cloud + C2C distances)
-    *_top_with_dist_for_<bot_id>_snipped.bin    # manual crop saved by operator in CC
-    *_bottom_with_dist_for_<top_id>_snipped.bin # manual crop saved by operator in CC
+  SU<su>/                           # one folder per SU, e.g. SU20002/
+    SU<su>_<top_id>_top_with_dist_for_<bot_id>.bin    # pre_snip output, one pair per SU (top cloud + C2C distances); cropped in place by operator
+    SU<su>_<bot_id>_bottom_with_dist_for_<top_id>.bin # pre_snip output, one pair per SU (bottom cloud + C2C distances); cropped in place by operator
     SU_<su>_top_raw.obj               # top surface mesh (post_snip output)
-    debug_*.png                       # debug images from auto_snip_script.py
+    <su>_post_snip.bin                # saved CloudCompare project (post_snip output)
   DEMs/
     Pgram_Job_<id>_<SU>_dem.tif       # GeoTIFF DEM for each photogrammetry job
   Final_Volumes/                      # output meshes (ignored by git)
@@ -129,12 +127,12 @@ Data/
 
 ### Manual-snip file contract
 
-After Pre-Snip, the operator opens the pre-snip pair in CloudCompare via the "Open in CC" dashboard button, crops top and bottom, then **Save As** back into the same `Data/<top_id>/` folder with `_snipped` appended to each source name:
+Pre-snip writes **one bin pair per SU**, each in its own `Data/SU<su>/` folder. After Pre-Snip, the operator opens the SU's pair in CloudCompare via the "Open in CC" dashboard button (which opens only that SU's two bins), crops top and bottom, and **saves over the same files** in `Data/SU<su>/` — no rename:
 
-- Top crop:    `<top_id>_top_with_dist_for_<bot_id>_snipped.bin`
-- Bottom crop: `<bot_id>_bottom_with_dist_for_<top_id>_snipped.bin`
+- Top crop:    `Data/SU<su>/SU<su>_<top_id>_top_with_dist_for_<bot_id>.bin`
+- Bottom crop: `Data/SU<su>/SU<su>_<bot_id>_bottom_with_dist_for_<top_id>.bin`
 
-Post-snip finds these by globbing `*_top_with_dist_*_snipped.bin` and `*_bottom_with_dist_*_snipped.bin` in `Data/<top_id>/`. If multiple `_snipped` files exist (re-crops), the newest by mtime is used.
+Post-snip finds each SU's pair by globbing `*_top_with_dist_*.bin` and `*_bottom_with_dist_*.bin` inside `Data/SU<su>/`. There is no `_snipped` suffix: the SU folder names the pair, and the card stage (`to_be_post_snipped`) is the operator's assertion that cropping is done. If a file is re-cropped, the newest by mtime is used. (The `SU<su>_` filename prefix is redundant with the folder but kept so a bin stays self-describing if moved.)
 
 ---
 

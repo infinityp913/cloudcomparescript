@@ -381,6 +381,16 @@ def find_mesh_by_pgram_job(job_number, mesh_dir=INPUT_MESH_PATH):
     return None
 
 
+def _su_prefix(su) -> str:
+    """Filename prefix marking which SU a pre-snip cloud is for, e.g. 'SU20001_'.
+
+    Returns '' when the input.json entry carries no 'su' so the old, un-prefixed
+    naming is preserved for callers that don't supply one.
+    """
+    su = str(su).strip()
+    return f"SU{su}_" if su else ""
+
+
 def run_presnip_pipeline(json_filepath: str = "input.json") -> None:
     """
     Main entry point for pre-snip processing.
@@ -408,7 +418,9 @@ def run_presnip_pipeline(json_filepath: str = "input.json") -> None:
     for processed, job in enumerate(job_data):
         top_id    = find_mesh_by_pgram_job(job["top"])
         bottom_id = find_mesh_by_pgram_job(job["bottom"])
-        print(f"Processing job: Top ID = {top_id}, Bottom ID = {bottom_id}")
+        su        = str(job.get("su", "")).strip()
+        su_prefix = _su_prefix(su)
+        print(f"Processing job: SU = {su or '?'}, Top ID = {top_id}, Bottom ID = {bottom_id}")
         top_mesh    = load_mesh(INPUT_MESH_PATH, top_id)
         bottom_mesh = load_mesh(INPUT_MESH_PATH, bottom_id)
         top_cloud    = sample_mesh(top_mesh)
@@ -420,10 +432,15 @@ def run_presnip_pipeline(json_filepath: str = "input.json") -> None:
         )
         print(f"Computed distances for {top_id} and {bottom_id}.")
 
-        output_dir = os.path.join(DATA_DIR, top_id)
+        # One pre-snip cloud pair per SU, in its own Data/SU<su>/ folder. The
+        # filenames still carry the full top/bottom PLY stems so the pgram pairing
+        # is visible. Falls back to the top PLY stem when an entry has no su.
+        output_dir = os.path.join(DATA_DIR, f"SU{su}" if su else top_id)
         os.makedirs(output_dir, exist_ok=True)
-        save_cloud(output_dir, top_with_dist,    f"top_with_dist_for_{bottom_id}")
-        save_cloud(output_dir, bottom_with_dist, f"bottom_with_dist_for_{top_id}")
+        save_cloud(output_dir, top_with_dist,
+                   file_name=f"{su_prefix}{top_id}_top_with_dist_for_{bottom_id}")
+        save_cloud(output_dir, bottom_with_dist,
+                   file_name=f"{su_prefix}{bottom_id}_bottom_with_dist_for_{top_id}")
         tarp_progress.report(processed + 1, total, top_id)
 
     print("Completed pre-snip processing.")
