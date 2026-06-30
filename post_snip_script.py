@@ -2,10 +2,8 @@ import json
 import re
 import cloudComPy as cc
 import cloudComPy.PoissonRecon
-import gc
 import os
 import sys
-import math
 import numpy as np
 
 from pre_snip_script import save_mesh, DATA_DIR, save_project
@@ -22,14 +20,34 @@ for _stream in (sys.stdout, sys.stderr):
 
 POINT_CLOUD_DIR = "Data"
 
-# Percentile of the Poisson density scalar field below which top-mesh faces are
-# discarded. Poisson on the open top surface extrapolates a low-density "skirt"
-# out to a rectangular boundary past the real SU edge — the boundary operators
-# used to shrink by hand in CloudCompare by tightening the density SF display
-# range on '<su>_top_raw'. Filtering low-density faces collapses it to the true
-# edge automatically. Higher = trims more aggressively; tune per-site if the
-# auto-trim leaves a skirt or eats into the real surface.
-TOP_MESH_DENSITY_MIN_PCT = 20
+
+def _volumetrics_dir():
+    """Root of this season's Volumetrics_<year> folder. The dashboard passes it via
+    TARP_VOLUMETRICS_DIR (built from base_path + season_year in config.yaml); when this
+    script is run standalone, fall back to a local 'Volumetrics' folder so the run still
+    succeeds."""
+    return os.environ.get("TARP_VOLUMETRICS_DIR") or f"{POINT_CLOUD_DIR}/Volumetrics"
+
+
+def _trench_name(su_number):
+    """'Trench NNNNN' for an SU id (e.g. 20001 -> 'Trench 20000'), matching the lab's
+    trench-folder convention. Returns None if the SU id has no digits."""
+    m = re.search(r"\d+", str(su_number))
+    if not m:
+        return None
+    return f"Trench {(int(m.group(0)) // 1000) * 1000}"
+
+# The top mesh's phantom skirt is trimmed by auto-detecting the split between the
+# low-density skirt and the high-density real surface in the Poisson density SF
+# (Otsu's method — see _auto_density_threshold). This replaces the manual step of
+# tightening the density SF display range by hand on '<su>_top_raw' in CloudCompare.
+#
+# Safety cap: the auto threshold is clamped so it never removes more than this
+# percentage of faces. Otsu finds the skirt/surface valley on its own, but on an
+# (almost) skirt-free mesh it would still split the real surface — the cap keeps it
+# from eating good geometry in that case. Raise if a real skirt survives; lower if
+# the surface gets clipped. Prefer leaving a little skirt over losing real surface.
+TOP_MESH_DENSITY_MAX_CUT_PCT = 15
 
 
 
@@ -157,13 +175,53 @@ def load_top_bottom_from_bin(bin_path, top_pgram, bot_pgram):
     return clouds[0], clouds[1]
 
 
-def trim_mesh_by_density(mesh, density_min_pct=10):
-    """Remove low-density Poisson faces (phantom boundary bubbles).
+def _auto_density_threshold(finite_vals, max_cut_pct=15):
+    """Auto-detect the density value separating the low-density skirt from the
+    high-density real surface, via Otsu's method on the density histogram.
+
+    Returns the threshold (keep values >= it), clamped so it never removes more
+    than `max_cut_pct` percent of the values. Returns None if a threshold can't
+    be computed (empty/degenerate distribution), so callers fall back gracefully.
+    """
+    if len(finite_vals) == 0:
+        return None
+    vmin, vmax = float(finite_vals.min()), float(finite_vals.max())
+    if vmax <= vmin:
+        return None
+
+    # Otsu: pick the histogram split maximising between-class variance.
+    hist, edges = np.histogram(finite_vals, bins=256, range=(vmin, vmax))
+    hist = hist.astype(np.float64)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    w0 = np.cumsum(hist)                       # weight of the low (skirt) class
+    w1 = w0[-1] - w0                           # weight of the high (surface) class
+    cum_mean = np.cumsum(hist * centers)
+    mean_total = cum_mean[-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m0 = cum_mean / w0
+        m1 = (mean_total - cum_mean) / w1
+        between = w0 * w1 * (m0 - m1) ** 2
+    between[~np.isfinite(between)] = 0.0
+    otsu_t = float(centers[int(np.argmax(between))])
+
+    # Clamp: never cut more than max_cut_pct% of faces (protects the real surface
+    # when the distribution is ~unimodal and Otsu would split it arbitrarily).
+    cap_t = float(np.percentile(finite_vals, max_cut_pct))
+    return min(otsu_t, cap_t)
+
+
+def trim_mesh_by_density(mesh, density_min_pct=10, auto=False, max_cut_pct=15):
+    """Remove low-density Poisson faces (phantom boundary bubbles / skirt).
 
     Poisson reconstruction with density=True assigns a per-vertex density
     scalar. Phantom faces at the crop boundary have few real points nearby
     and thus low density.  Filtering by density removes these artifacts.
-    Falls back to the original mesh if the API call fails.
+
+    With auto=False the cut is a fixed `density_min_pct` percentile (used for the
+    merged volume mesh). With auto=True the skirt/surface split is auto-detected
+    via Otsu and clamped to at most `max_cut_pct` of faces (used for the open top
+    mesh, whose skirt fraction varies per SU). Falls back to the original mesh if
+    the API call fails.
     """
     try:
         vert_cloud = mesh.getAssociatedCloud()
@@ -182,11 +240,21 @@ def trim_mesh_by_density(mesh, density_min_pct=10):
         finite = vals[np.isfinite(vals)]
         if len(finite) == 0:
             return mesh
-        threshold = float(np.percentile(finite, density_min_pct))
-        sf_max = float(sf.getMax())
-        print(f"  Density trim: threshold={threshold:.3f} "
-              f"(p{density_min_pct} of {len(finite)} vertices)")
 
+        if auto:
+            threshold = _auto_density_threshold(finite, max_cut_pct=max_cut_pct)
+            if threshold is None:
+                print("  Density trim (auto): degenerate distribution, skipping")
+                return mesh
+            pct_removed = float((finite < threshold).mean() * 100.0)
+            print(f"  Density trim (auto/Otsu): threshold={threshold:.3f} "
+                  f"(~{pct_removed:.1f}% of {len(finite)} verts, cap {max_cut_pct}%)")
+        else:
+            threshold = float(np.percentile(finite, density_min_pct))
+            print(f"  Density trim: threshold={threshold:.3f} "
+                  f"(p{density_min_pct} of {len(finite)} vertices)")
+
+        sf_max = float(sf.getMax())
         trimmed = cc.filterBySFValue(threshold, sf_max * 1.01, mesh)
 
         if trimmed is not None and trimmed.size() > 0:
@@ -221,7 +289,6 @@ def filter_by_c2c_distance(cloud, low_percentile=10):
     sf = cloud.getScalarField(sf_idx)
     sf_name = sf.getName()
 
-    import numpy as np
     vals = sf.toNpArrayCopy()
     finite = vals[np.isfinite(vals)]
     if len(finite) == 0:
@@ -339,68 +406,12 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
     if top_mesh is not None:
         try:
             top_mesh_trimmed = trim_mesh_by_density(
-                top_mesh, density_min_pct=TOP_MESH_DENSITY_MIN_PCT)
+                top_mesh, auto=True, max_cut_pct=TOP_MESH_DENSITY_MAX_CUT_PCT)
             if top_mesh_trimmed is not top_mesh:
                 top_mesh_trimmed.setName(f"{su_number}_top_trimmed")
         except Exception as e:
             print(f"  Top mesh density trim failed ({e}) — using raw top mesh")
             top_mesh_trimmed = top_mesh
-
-    # # filter the top cloud by density and run poisson reconstruction on it
-    # if top_cloud is not None:
-    #     if top_cloud.getNumberOfScalarFields() > 0:
-    #         try:
-    #             # filter out the points of top_cloud by density filtering out anything below 1 standard deviation away from the mean
-    #             sfc = top_cloud.getScalarField(top_cloud.getNumberOfScalarFields() - 1)
-    #             sf_mean, sf_variance = sfc.computeMeanAndVariance()
-    #             top_cloud_filtered = cc.filterBySFValue(
-    #                 float(sf_mean - math.sqrt(sf_variance)),
-    #                 float(sfc.getMax()),
-    #                 top_cloud.cloneThis(),
-    #             )
-    #             top_cloud_filtered.setName(f"{su_number}_top_cloud_filtered")
-    #             print(
-    #                 f"Filtered top cloud created with {top_cloud_filtered.size()} points."
-    #             )
-    #         except Exception as e:
-    #             print(f"Error filtering top cloud: {e}")
-    #             top_cloud_filtered = None
-
-    #         try:
-    #             if top_cloud_filtered is not None:
-    #                 top_mesh_filtered = cc.PoissonRecon.PR.PoissonReconstruction(
-    #                     top_cloud_filtered,
-    #                     depth=11,
-    #                     density=True,
-    #                 )
-    #                 top_mesh_filtered.setName(f"{su_number}_top_filtered")
-    #                 if top_mesh_filtered is None:
-    #                     print(
-    #                         "Warning: Poisson reconstruction for filtered top cloud returned None, trying with different parameters..."
-    #                     )
-    #                     # Try again with even lower depth
-    #                     top_mesh_filtered = cc.PoissonRecon.PR.PoissonReconstruction(
-    #                         top_cloud_filtered, depth=8, density=True
-    #                     )
-    #                 else:
-    #                     top_mesh_filtered.setName(f"{su_number}_top_filtered")
-    #                     print(
-    #                         "Mesh created for filtered top cloud with Poisson Reconstructions."
-    #                     )
-    #             else:
-    #                 print("No filtered top cloud available, skipping Poisson reconstruction.")
-    #                 top_mesh_filtered = None
-    #         except Exception as e:
-    #             print(f"Error during Poisson reconstruction for filtered top cloud: {e}")
-    #             top_mesh_filtered = None
-    #     else:
-    #         print(
-    #             "Warning: Top cloud has no scalar fields, skipping filtering and Poisson reconstruction."
-    #         )
-    #         top_mesh_filtered = None
-    # else:
-    #     print("No top cloud available, skipping filtering and Poisson reconstruction.")
-    #     top_mesh_filtered = None
 
     # Measure 3D volume of the merged mesh
     if merged_mesh is not None:
@@ -460,33 +471,38 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
 
 
 def save_merged_mesh_and_top_mesh(su_number, merged_mesh, top_mesh):
-    """Save the merged mesh and top mesh to the specified directory.
+    """Save the merged volume mesh and the top mesh to their destinations.
+
+    The merged volume is written to Data/Final_Volumes/SU_<su>_raw.obj (where the
+    dashboard detects post-snip completion) and archived to Volumetrics_<year>/Trench
+    NNNNN/SU_<su>.obj. The top mesh is written to Volumetrics_<year>/SU Top OBJs/
+    SU_<su>_top.obj, where the Create-SU-Sheet QGIS script reads it.
+
     Args:
-        su_number (str): The identifier for the surface; also names the per-SU
-            working folder Data/SU<su_number>/ where the top mesh is written.
-        merged_mesh (cc.Mesh): The merged mesh to save.
+        su_number (str): The SU identifier (e.g. '20001'); also drives the trench folder.
+        merged_mesh (cc.Mesh): The merged volume mesh to save.
         top_mesh (cc.Mesh): The top mesh to save.
     """
-    # Save merged mesh. cc.SaveMesh does not create the target directory and
-    # fails silently if it's missing, so ensure it exists first (the dashboard
-    # detects post-snip completion by this OBJ in Data/Final_Volumes/).
-    try:
-        os.makedirs(f"{POINT_CLOUD_DIR}/Final_Volumes", exist_ok=True)
-        save_mesh(
-            f"{POINT_CLOUD_DIR}/Final_Volumes", merged_mesh, file_name=f"SU_{su_number}_raw"
-        )
-        print(
-            f"Mesh saved for {su_number} at {POINT_CLOUD_DIR}/Final_Volumes/SU_{su_number}_raw.obj"
-        )
-    except Exception as e:
-        print(f"Error saving mesh: {e}")
+    # Save the final volume mesh to this season's Volumetrics_<year>/Trench NNNNN/
+    # folder as SU_<su>.obj (the lab's archival convention). This is the OBJ the
+    # dashboard's Volume button opens. cc.SaveMesh does not create the target
+    # directory and fails silently if it's missing, so ensure it exists first.
+    trench = _trench_name(su_number)
+    if trench:
+        trench_dir = os.path.join(_volumetrics_dir(), trench)
+        try:
+            os.makedirs(trench_dir, exist_ok=True)
+            save_path = save_mesh(trench_dir, merged_mesh, file_name=f"SU_{su_number}")
+            print(f"Final volume saved for {su_number} at {save_path}")
+        except Exception as e:
+            print(f"Error saving final volume to Volumetrics: {e}")
+    else:
+        print(f"  {su_number}: no digits in SU id; cannot resolve trench folder, "
+              f"skipping final volume save")
 
     # Save the top mesh where the Create-SU-Sheet QGIS script (generate_su_sheets.py)
-    # reads it: <base>/Volumetrics_<year>/SU Top OBJs/SU_<su>_top.obj. The dashboard
-    # passes that resolved directory via TARP_SU_TOP_OBJ_DIR (built from base_path +
-    # season_year in config.yaml); when this script is run standalone, fall back to a
-    # local 'SU Top OBJs' folder so the run still succeeds.
-    su_top_obj_dir = os.environ.get("TARP_SU_TOP_OBJ_DIR") or f"{POINT_CLOUD_DIR}/SU Top OBJs"
+    # reads it: <Volumetrics_<year>>/SU Top OBJs/SU_<su>_top.obj.
+    su_top_obj_dir = os.path.join(_volumetrics_dir(), "SU Top OBJs")
     try:
         os.makedirs(su_top_obj_dir, exist_ok=True)
         save_path = save_mesh(
@@ -497,23 +513,6 @@ def save_merged_mesh_and_top_mesh(su_number, merged_mesh, top_mesh):
         print(f"Top mesh saved for {su_number} at {save_path}")
     except Exception as e:
         print(f"Error saving top mesh: {e}")
-
-    # # Save filtered top mesh if it exists
-    # if top_mesh_filtered:
-    #     try:
-    #         save_mesh(
-    #             f"{POINT_CLOUD_DIR}/Final_Volume_Tops",
-    #             top_mesh_filtered,
-    #             file_name=f"SU_{su_number}_top_filtered",
-    #         )
-    #         print(
-    #             f"Filtered top mesh saved for {su_number} at {POINT_CLOUD_DIR}/Final_Volume_Tops/SU_{su_number}_top_filtered.obj"
-    #         )
-    #     except Exception as e:
-    #         print(f"Error saving filtered top mesh: {e}")
-
-    # Force garbage collection to free memory
-    # gc.collect()
 
 
 def update_volume_measurements(volume_file, su_number, volume_3d, volume_25d, isWarning):
