@@ -31,6 +31,11 @@ __pycache__/
 # Backup files
 *-backup.json
 
+# Run artifacts (written fresh on every pipeline run — not source)
+/input.json
+/progress.json
+/volume_measures.txt
+
 # Large data directories
 Data/Pgram_Job_*/
 Data/Final_Volumes/
