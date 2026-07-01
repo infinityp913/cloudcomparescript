@@ -37,17 +37,20 @@ def _trench_name(su_number):
         return None
     return f"Trench {(int(m.group(0)) // 1000) * 1000}"
 
-# The top mesh's phantom skirt is trimmed by auto-detecting the split between the
-# low-density skirt and the high-density real surface in the Poisson density SF
-# (Otsu's method — see _auto_density_threshold). This replaces the manual step of
-# tightening the density SF display range by hand on '<su>_top_raw' in CloudCompare.
+# The top mesh's phantom skirt (Poisson's extrapolated closing surface reaching
+# past the real SU edge) is trimmed by each vertex's DISTANCE to the input top
+# cloud, not by Poisson density. Interior vertices — even in sparsely-sampled
+# patches — are always within ~one sample spacing of a real point, so distance-
+# trimming removes only the far outer skirt and can never punch interior holes
+# (which density-thresholding did). The keep/cut split is auto-detected with Otsu
+# on the bimodal distance distribution (interior ≈ 0 vs skirt ≫ 0). This replaces
+# the manual step of tightening the SF display range on '<su>_top_raw' in CC.
 #
-# Safety cap: the auto threshold is clamped so it never removes more than this
-# percentage of faces. Otsu finds the skirt/surface valley on its own, but on an
-# (almost) skirt-free mesh it would still split the real surface — the cap keeps it
-# from eating good geometry in that case. Raise if a real skirt survives; lower if
-# the surface gets clipped. Prefer leaving a little skirt over losing real surface.
-TOP_MESH_DENSITY_MAX_CUT_PCT = 15
+# Safety cap: never remove more than this % of faces (guards a bad Otsu split).
+# Removing high-distance faces only ever nibbles the outer rim, never the interior,
+# so erring low just leaves a little skirt. Raise if a skirt survives; lower if the
+# rim gets over-trimmed.
+TOP_MESH_DIST_MAX_CUT_PCT = 50
 
 
 
@@ -175,13 +178,10 @@ def load_top_bottom_from_bin(bin_path, top_pgram, bot_pgram):
     return clouds[0], clouds[1]
 
 
-def _auto_density_threshold(finite_vals, max_cut_pct=15):
-    """Auto-detect the density value separating the low-density skirt from the
-    high-density real surface, via Otsu's method on the density histogram.
-
-    Returns the threshold (keep values >= it), clamped so it never removes more
-    than `max_cut_pct` percent of the values. Returns None if a threshold can't
-    be computed (empty/degenerate distribution), so callers fall back gracefully.
+def _otsu_threshold(finite_vals):
+    """Otsu split of a 1-D distribution: the value maximising between-class
+    variance on a 256-bin histogram. Returns the threshold, or None for an
+    empty/degenerate distribution so callers can fall back gracefully.
     """
     if len(finite_vals) == 0:
         return None
@@ -189,12 +189,11 @@ def _auto_density_threshold(finite_vals, max_cut_pct=15):
     if vmax <= vmin:
         return None
 
-    # Otsu: pick the histogram split maximising between-class variance.
     hist, edges = np.histogram(finite_vals, bins=256, range=(vmin, vmax))
     hist = hist.astype(np.float64)
     centers = (edges[:-1] + edges[1:]) / 2.0
-    w0 = np.cumsum(hist)                       # weight of the low (skirt) class
-    w1 = w0[-1] - w0                           # weight of the high (surface) class
+    w0 = np.cumsum(hist)               # cumulative weight of the low class
+    w1 = w0[-1] - w0                   # weight of the high class
     cum_mean = np.cumsum(hist * centers)
     mean_total = cum_mean[-1]
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -202,70 +201,65 @@ def _auto_density_threshold(finite_vals, max_cut_pct=15):
         m1 = (mean_total - cum_mean) / w1
         between = w0 * w1 * (m0 - m1) ** 2
     between[~np.isfinite(between)] = 0.0
-    otsu_t = float(centers[int(np.argmax(between))])
-
-    # Clamp: never cut more than max_cut_pct% of faces (protects the real surface
-    # when the distribution is ~unimodal and Otsu would split it arbitrarily).
-    cap_t = float(np.percentile(finite_vals, max_cut_pct))
-    return min(otsu_t, cap_t)
+    return float(centers[int(np.argmax(between))])
 
 
-def trim_mesh_by_density(mesh, density_min_pct=10, auto=False, max_cut_pct=15):
-    """Remove low-density Poisson faces (phantom boundary bubbles / skirt).
+def trim_mesh_by_distance_to_cloud(mesh, ref_cloud, max_cut_pct=50):
+    """Trim the phantom Poisson skirt off an open-surface mesh by each vertex's
+    distance to the input point cloud.
 
-    Poisson reconstruction with density=True assigns a per-vertex density
-    scalar. Phantom faces at the crop boundary have few real points nearby
-    and thus low density.  Filtering by density removes these artifacts.
+    Poisson closes an open surface by extrapolating a "skirt" out past the real
+    edge; those phantom vertices sit far from any real sample, while every interior
+    vertex — even in a sparsely-sampled patch — stays within ~one sample spacing of
+    a point. So thresholding on distance-to-cloud removes only the outer skirt and
+    can NEVER punch interior holes (unlike a density threshold).
 
-    With auto=False the cut is a fixed `density_min_pct` percentile (used for the
-    merged volume mesh). With auto=True the skirt/surface split is auto-detected
-    via Otsu and clamped to at most `max_cut_pct` of faces (used for the open top
-    mesh, whose skirt fraction varies per SU). Falls back to the original mesh if
-    the API call fails.
+    The keep/cut split is auto-detected with Otsu on the (bimodal: interior ≈ 0 vs
+    skirt ≫ 0) distance distribution, clamped so it never removes more than
+    `max_cut_pct` of faces. Falls back to the original mesh on any failure.
     """
     try:
         vert_cloud = mesh.getAssociatedCloud()
-        n_sf = vert_cloud.getNumberOfScalarFields()
-        if n_sf == 0:
-            print("  Density trim: no SFs on vertex cloud, skipping")
+        # Distance from each mesh vertex to the nearest real sample point, added as
+        # a scalar field on the mesh's vertex cloud in place. Use the EXACT C2C
+        # distance (not approx): the approximate version is octree-quantized, so the
+        # trim threshold lands on coarse cell boundaries and gives a blocky/staircase
+        # edge — exact NN distance varies smoothly, so the trimmed boundary is clean.
+        _params = cc.Cloud2CloudDistancesComputationParams()
+        _params.maxThreadCount = 0  # auto
+        cc.DistanceComputationTools.computeCloud2CloudDistances(vert_cloud, ref_cloud, _params)
+        sf_idx = vert_cloud.getNumberOfScalarFields() - 1
+        if sf_idx < 0:
+            print("  Distance trim: no distance SF produced, skipping")
             return mesh
+        vert_cloud.setCurrentOutScalarField(sf_idx)
+        sf = vert_cloud.getScalarField(sf_idx)
 
-        density_sf_idx = 0
-        vert_cloud.setCurrentScalarField(density_sf_idx)
-        sf = vert_cloud.getScalarField(density_sf_idx)
-        print(f"  Density trim: SF='{sf.getName()}' "
-              f"range [{sf.getMin():.2f}, {sf.getMax():.2f}]")
-
-        vals = sf.toNpArrayCopy()
-        finite = vals[np.isfinite(vals)]
+        d = sf.toNpArrayCopy()
+        finite = d[np.isfinite(d)]
         if len(finite) == 0:
+            print("  Distance trim: all distances non-finite, skipping")
             return mesh
 
-        if auto:
-            threshold = _auto_density_threshold(finite, max_cut_pct=max_cut_pct)
-            if threshold is None:
-                print("  Density trim (auto): degenerate distribution, skipping")
-                return mesh
-            pct_removed = float((finite < threshold).mean() * 100.0)
-            print(f"  Density trim (auto/Otsu): threshold={threshold:.3f} "
-                  f"(~{pct_removed:.1f}% of {len(finite)} verts, cap {max_cut_pct}%)")
-        else:
-            threshold = float(np.percentile(finite, density_min_pct))
-            print(f"  Density trim: threshold={threshold:.3f} "
-                  f"(p{density_min_pct} of {len(finite)} vertices)")
+        otsu_t = _otsu_threshold(finite)
+        # Safety cap: keep at least (100 - max_cut_pct)% of vertices — never remove
+        # more than max_cut_pct even if Otsu picks too low a split. Clamping the
+        # threshold UP only ever leaves more skirt, never eats the interior.
+        floor_t = float(np.percentile(finite, 100 - max_cut_pct))
+        threshold = max(otsu_t, floor_t) if otsu_t is not None else floor_t
+        pct_removed = float((finite > threshold).mean() * 100.0)
+        print(f"  Distance trim (auto/Otsu): keep dist<={threshold:.4f} m "
+              f"(~{pct_removed:.1f}% of {len(finite)} verts cut, cap {max_cut_pct}%)")
 
-        sf_max = float(sf.getMax())
-        trimmed = cc.filterBySFValue(threshold, sf_max * 1.01, mesh)
-
+        trimmed = cc.filterBySFValue(0.0, threshold, mesh)
         if trimmed is not None and trimmed.size() > 0:
-            print(f"  Density trim: {mesh.size()} ->{trimmed.size()} faces")
+            print(f"  Distance trim: {mesh.size()} ->{trimmed.size()} faces")
             trimmed.setName(mesh.getName() + "_trimmed")
             return trimmed
-        else:
-            print("  Density trim: filterBySFValue returned empty/None, using original")
-            return mesh
+        print("  Distance trim: filterBySFValue returned empty/None, using original")
+        return mesh
     except Exception as e:
-        print(f"  Density trim failed ({e}) — using original mesh")
+        print(f"  Distance trim failed ({e}) — using original mesh")
         return mesh
 
 
@@ -317,16 +311,27 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
         print("Error: missing top or bottom cloud")
         return None, None, None
 
-    top_cloud.setName(f"SU{su_number}_top")
-    bottom_cloud.setName(f"SU{su_number}_bottom")
+    top_cloud.setName(f"SU_{su_number}_top")
+    bottom_cloud.setName(f"SU_{su_number}_bottom")
     print(f"Top cloud: {top_cloud.size()} points; "
           f"Bottom cloud: {bottom_cloud.size()} points")
+
+    # Keep the full (unfiltered) top cloud for the top-only reconstruction and its
+    # distance-trim reference, so the interior stays densely sampled and thin edges
+    # (whose points c2c-filtering removes) aren't mistaken for skirt. The merge/
+    # volume path still uses the c2c-filtered clouds (fringe points removed to avoid
+    # Poisson bubbles).
+    top_cloud_full = top_cloud
 
     # Filter out low-C2C-distance fringe points that cause Poisson bubble artifacts
     top_cloud    = filter_by_c2c_distance(top_cloud,    low_percentile=25)
     bottom_cloud = filter_by_c2c_distance(bottom_cloud, low_percentile=25)
 
     # Check if clouds have normals
+    if not top_cloud_full.hasNormals():
+        print("Warning: Top cloud (full) has no normals, computing...")
+        cc.computeNormals([top_cloud_full])
+
     if not top_cloud.hasNormals():
         print("Warning: Top cloud has no normals, computing...")
         cc.computeNormals([top_cloud])
@@ -370,10 +375,14 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
             depth=11,
             density=True,
         )
-        merged_mesh.setName(f"{su_number}_merged")
+        merged_mesh.setName(f"SU_{su_number}_merged")
         if merged_mesh is not None:
+            # Per the lab's volume-modeling doc, Poisson on the combined cloud should
+            # already produce a nice SOLID watertight mesh — so no routine trimming.
+            # (The old density-percentile trim here is what punched interior swiss-
+            # cheese holes on sparser SUs; large-bubble cases remain a rare manual
+            # edit, as the doc notes.)
             print("Mesh created with Poisson Reconstruction.")
-            merged_mesh = trim_mesh_by_density(merged_mesh, density_min_pct=10)
         else:
             print("Error: Failed to create mesh")
 
@@ -383,34 +392,36 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
     print("Starting Poisson Reconstruction for top cloud...")
 
     try:
+        # Reconstruct from the FULL (unfiltered) top cloud so the interior stays
+        # densely sampled — the phantom skirt is removed afterwards by distance.
         top_mesh = cc.PoissonRecon.PR.PoissonReconstruction(
-            top_cloud,
+            top_cloud_full,
             depth=11,
             density=True,
         )
-        top_mesh.setName(f"{su_number}_top_raw")
+        top_mesh.setName(f"SU_{su_number}_top_raw")
 
-        if merged_mesh is not None:
+        if top_mesh is not None:
             print("Mesh created with Poisson Reconstructions.")
         else:
-            print("Error: Failed to create mesh")
+            print("Error: Failed to create top mesh")
     except Exception as e:
         print(f"Error during Poisson reconstruction for top cloud: {e}")
 
-    # Trim the phantom Poisson skirt off the top mesh the same way the merged
-    # mesh is trimmed above. This replaces the manual CloudCompare step where the
-    # operator opens '<su>_post_snip.bin', selects '<su>_top_raw' and shrinks its
-    # rectangular boundary by adjusting the density SF display range. The raw mesh
-    # is kept in the project bin so that manual fallback is still possible.
+    # Trim the phantom Poisson skirt off the top mesh by distance to the input top
+    # cloud (see trim_mesh_by_distance_to_cloud). This replaces the manual step of
+    # opening '<su>_post_snip.bin', selecting '<su>_top_raw' and shrinking its
+    # rectangular boundary by hand in CloudCompare. The raw mesh is kept in the
+    # project bin so manual fallback is still possible.
     top_mesh_trimmed = top_mesh
     if top_mesh is not None:
         try:
-            top_mesh_trimmed = trim_mesh_by_density(
-                top_mesh, auto=True, max_cut_pct=TOP_MESH_DENSITY_MAX_CUT_PCT)
+            top_mesh_trimmed = trim_mesh_by_distance_to_cloud(
+                top_mesh, top_cloud_full, max_cut_pct=TOP_MESH_DIST_MAX_CUT_PCT)
             if top_mesh_trimmed is not top_mesh:
-                top_mesh_trimmed.setName(f"{su_number}_top_trimmed")
+                top_mesh_trimmed.setName(f"SU_{su_number}_top_trimmed")
         except Exception as e:
-            print(f"  Top mesh density trim failed ({e}) — using raw top mesh")
+            print(f"  Top mesh distance trim failed ({e}) — using raw top mesh")
             top_mesh_trimmed = top_mesh
 
     # Measure 3D volume of the merged mesh
