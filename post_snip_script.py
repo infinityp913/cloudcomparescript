@@ -263,47 +263,6 @@ def trim_mesh_by_distance_to_cloud(mesh, ref_cloud, max_cut_pct=50):
         return mesh
 
 
-def filter_by_c2c_distance(cloud, low_percentile=10):
-    """
-    Remove points whose C2C distance scalar field value falls below
-    `low_percentile` percent of the distribution. These low-distance fringe
-    points sit where the top/bottom surfaces nearly meet at the SU boundary
-    and cause Poisson to fill in phantom bubble surfaces.
-
-    Returns a filtered clone, or the original cloud if filtering isn't possible.
-    """
-    n_sf = cloud.getNumberOfScalarFields()
-    if n_sf == 0:
-        print(f"  C2C filter: no scalar fields on {cloud.getName()}, skipping")
-        return cloud
-
-    # The C2C distance field is the first scalar field added by pre_snip
-    sf_idx = 0
-    cloud.setCurrentOutScalarField(sf_idx)
-    sf = cloud.getScalarField(sf_idx)
-    sf_name = sf.getName()
-
-    vals = sf.toNpArrayCopy()
-    finite = vals[np.isfinite(vals)]
-    if len(finite) == 0:
-        print(f"  C2C filter: all values non-finite on {cloud.getName()}, skipping")
-        return cloud
-
-    threshold = float(np.percentile(finite, low_percentile))
-    sf_max    = float(finite.max())
-    print(f"  C2C filter '{sf_name}': keeping >{threshold:.4f} m "
-          f"(p{low_percentile} of [{finite.min():.4f}, {sf_max:.4f}])")
-
-    filtered = cc.filterBySFValue(threshold, sf_max * 1.01, cloud)
-    if filtered is None or filtered.size() == 0:
-        print(f"  C2C filter: result empty, using original {cloud.getName()}")
-        return cloud
-
-    filtered.setName(cloud.getName() + "_c2c_filtered")
-    print(f"  C2C filter: {cloud.size()} ->{filtered.size()} pts")
-    return filtered
-
-
 def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
     print(f"Processing snipped clouds for SU {su_number}...")
 
@@ -316,22 +275,13 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
     print(f"Top cloud: {top_cloud.size()} points; "
           f"Bottom cloud: {bottom_cloud.size()} points")
 
-    # Keep the full (unfiltered) top cloud for the top-only reconstruction and its
-    # distance-trim reference, so the interior stays densely sampled and thin edges
-    # (whose points c2c-filtering removes) aren't mistaken for skirt. The merge/
-    # volume path still uses the c2c-filtered clouds (fringe points removed to avoid
-    # Poisson bubbles).
-    top_cloud_full = top_cloud
-
-    # Filter out low-C2C-distance fringe points that cause Poisson bubble artifacts
-    top_cloud    = filter_by_c2c_distance(top_cloud,    low_percentile=25)
-    bottom_cloud = filter_by_c2c_distance(bottom_cloud, low_percentile=25)
+    # Per the volume-modeling doc, the merged VOLUME mesh is built from the FULL top
+    # + bottom clouds (flip bottom normals -> merge -> Poisson -> solid mesh). We do
+    # NOT filter the clouds first: dropping points under-samples the merged cloud so
+    # Poisson can't close it and leaves holes in the volume. (A pre-merge c2c-distance
+    # filter here is exactly what produced the holey volumes.)
 
     # Check if clouds have normals
-    if not top_cloud_full.hasNormals():
-        print("Warning: Top cloud (full) has no normals, computing...")
-        cc.computeNormals([top_cloud_full])
-
     if not top_cloud.hasNormals():
         print("Warning: Top cloud has no normals, computing...")
         cc.computeNormals([top_cloud])
@@ -392,10 +342,10 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
     print("Starting Poisson Reconstruction for top cloud...")
 
     try:
-        # Reconstruct from the FULL (unfiltered) top cloud so the interior stays
-        # densely sampled — the phantom skirt is removed afterwards by distance.
+        # Reconstruct from the top cloud (full, same as the merge) — the phantom
+        # skirt from the open surface is removed afterwards by distance.
         top_mesh = cc.PoissonRecon.PR.PoissonReconstruction(
-            top_cloud_full,
+            top_cloud,
             depth=11,
             density=True,
         )
@@ -410,14 +360,14 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
 
     # Trim the phantom Poisson skirt off the top mesh by distance to the input top
     # cloud (see trim_mesh_by_distance_to_cloud). This replaces the manual step of
-    # opening '<su>_post_snip.bin', selecting '<su>_top_raw' and shrinking its
+    # opening '<su>_post_snip.bin', selecting 'SU_<su>_top_raw' and shrinking its
     # rectangular boundary by hand in CloudCompare. The raw mesh is kept in the
     # project bin so manual fallback is still possible.
     top_mesh_trimmed = top_mesh
     if top_mesh is not None:
         try:
             top_mesh_trimmed = trim_mesh_by_distance_to_cloud(
-                top_mesh, top_cloud_full, max_cut_pct=TOP_MESH_DIST_MAX_CUT_PCT)
+                top_mesh, top_cloud, max_cut_pct=TOP_MESH_DIST_MAX_CUT_PCT)
             if top_mesh_trimmed is not top_mesh:
                 top_mesh_trimmed.setName(f"SU_{su_number}_top_trimmed")
         except Exception as e:
