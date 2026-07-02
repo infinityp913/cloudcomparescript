@@ -52,6 +52,24 @@ def _trench_name(su_number):
 # rim gets over-trimmed.
 TOP_MESH_DIST_MAX_CUT_PCT = 50
 
+# Point cap for the TOP-mesh Poisson only. The top mesh exists solely to derive the
+# SU's 2-D footprint for the SU sheet, so an oversized top cloud (e.g. a poorly-cropped
+# SU) just yields a huge OBJ that later chokes the Blender/QGIS shapefile step. When the
+# top cloud exceeds this, a random-subsampled COPY is fed to the top Poisson; the full
+# top_cloud is left untouched for the merged volume, the 2.5D volume, and the distance
+# trim reference. Normal SUs (~25-30k pts) are far below this and pass through unchanged.
+TOP_MESH_MAX_POINTS = 200_000
+
+# Octree depth for the merged VOLUME Poisson reconstruction. Thin SUs (a deposit
+# only ~1 cm thick over surfaces with tens of cm of relief) pinch to just a few
+# octree cells; at depth 11 (~1 mm cells) Poisson's smoothing can't hold the two
+# opposing surfaces apart in the thinnest spots and leaves holes. A deeper octree
+# (finer cells -> more cells across the slab) resolves the thin slab. Raise to 13
+# if holes persist on very thin SUs; lower to 11 (the doc default) if memory/time
+# is tight on large clouds. The top mesh stays at 11 — it's a single surface with
+# no thin-slab problem.
+MERGED_MESH_POISSON_DEPTH = 12
+
 
 
 def find_combined_bin(point_cloud_dir, su):
@@ -319,13 +337,12 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
     top_mesh = None
     print("Starting Poisson reconstruction for merged cloud...")
     try:
-        # Try with lower depth first to avoid memory issues
         merged_mesh = cc.PoissonRecon.PR.PoissonReconstruction(
             merged_cloud,
-            depth=11,
+            depth=MERGED_MESH_POISSON_DEPTH,
             density=True,
         )
-        merged_mesh.setName(f"SU_{su_number}_merged")
+        merged_mesh.setName(f"SU_{su_number}")
         if merged_mesh is not None:
             # Per the lab's volume-modeling doc, Poisson on the combined cloud should
             # already produce a nice SOLID watertight mesh — so no routine trimming.
@@ -341,11 +358,32 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
 
     print("Starting Poisson Reconstruction for top cloud...")
 
+    # Cap the point count fed to the TOP Poisson only (see TOP_MESH_MAX_POINTS). This
+    # keeps a badly-cropped/oversized SU from producing a multi-million-face OBJ that
+    # hangs the downstream shapefile step. The full top_cloud is used everywhere else
+    # (merge, 2.5D volume, distance-trim reference), so volumes are unaffected.
+    top_mesh_src = top_cloud
+    if top_cloud.size() > TOP_MESH_MAX_POINTS:
+        try:
+            ref = cc.CloudSamplingTools.subsampleCloudRandomly(top_cloud, TOP_MESH_MAX_POINTS)
+            capped = top_cloud.partialClone(ref)[0]  # (ccPointCloud, CLONE_WARNINGS)
+            if capped is not None and capped.size() > 0:
+                capped.setName(f"SU_{su_number}_top_capped")
+                if top_cloud.hasNormals():
+                    cc.computeNormals([capped])
+                top_mesh_src = capped
+                print(f"  Top cloud {top_cloud.size()} pts > cap {TOP_MESH_MAX_POINTS}; "
+                      f"using {capped.size()} pts for sheet mesh (volume uses full cloud)")
+            else:
+                print("  Top-cloud cap produced empty clone; using full top cloud")
+        except Exception as e:
+            print(f"  Top-cloud cap failed ({e}); using full top cloud")
+
     try:
-        # Reconstruct from the top cloud (full, same as the merge) — the phantom
-        # skirt from the open surface is removed afterwards by distance.
+        # Reconstruct from the (optionally capped) top cloud — the phantom skirt from
+        # the open surface is removed afterwards by distance.
         top_mesh = cc.PoissonRecon.PR.PoissonReconstruction(
-            top_cloud,
+            top_mesh_src,
             depth=11,
             density=True,
         )
@@ -369,7 +407,7 @@ def merge_clouds_and_build_mesh(top_cloud, bottom_cloud, su_number):
             top_mesh_trimmed = trim_mesh_by_distance_to_cloud(
                 top_mesh, top_cloud, max_cut_pct=TOP_MESH_DIST_MAX_CUT_PCT)
             if top_mesh_trimmed is not top_mesh:
-                top_mesh_trimmed.setName(f"SU_{su_number}_top_trimmed")
+                top_mesh_trimmed.setName(f"SU_{su_number}_top")
         except Exception as e:
             print(f"  Top mesh distance trim failed ({e}) — using raw top mesh")
             top_mesh_trimmed = top_mesh
